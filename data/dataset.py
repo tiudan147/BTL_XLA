@@ -38,7 +38,7 @@ class FSSDataset:
 
     @classmethod
     def build_dataloader(cls, benchmark, bsz, nworker, fold, split, shot=1):
-        nworker = nworker if split == 'trn' else 0
+        # nworker = nworker if split == 'trn' else 0 # update của mình bỏ tự động ép số luồng về 0 để có thể chạy nhanh hơn
 
         dataset = cls.datasets[benchmark](cls.datapath, fold=fold,
                                           transform=cls.transform,

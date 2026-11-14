@@ -1,1 +1,10 @@
+# Byte-compiled / optimized / DLL files (File rác Python tự sinh)
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Môi trường ảo (Virtual Environment)
+.venv
+
 *.pdf
