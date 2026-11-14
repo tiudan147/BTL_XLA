@@ -1,1 +1,11 @@
 *.pdf
+
+.venv/
+
+# Sinh ra khi chạy demo.ipynb / main.py
+__pycache__/
+*.pyc
+datasets/
+demo_outputs/
+logs/
+_demo_exec_test.ipynb
