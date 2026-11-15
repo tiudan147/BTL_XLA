@@ -5,7 +5,16 @@
 # Sinh ra khi chạy demo.ipynb / main.py
 __pycache__/
 *.pyc
+# Datasets & compressed files
+dataset/
+dataset
 datasets/
+datasets
+*.zip
+*.tar
+*.tar.gz
+*.rar
+*.7z
 demo_outputs/
 logs/
 _demo_exec_test.ipynb

@@ -2,7 +2,7 @@ bus
 hotel_slipper
 burj_al
 reflex_camera
-abe's_flyingfish
+abes_flyingfish
 oiltank_car
 doormat
 fish_eagle
