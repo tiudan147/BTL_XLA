@@ -4,6 +4,8 @@ import torch
 
 class Evaluator:
     r""" Computes intersection and union between prediction and ground-truth """
+    ignore_index = 255
+
     @classmethod
     def initialize(cls):
         cls.ignore_index = 255
@@ -20,20 +22,24 @@ class Evaluator:
             gt_mask = gt_mask + query_ignore_idx
             pred_mask[gt_mask == cls.ignore_index] = cls.ignore_index
 
-        # compute intersection and union of each episode in a batch
-        area_inter, area_pred, area_gt = [],  [], []
-        for _pred_mask, _gt_mask in zip(pred_mask, gt_mask):
-            _inter = _pred_mask[_pred_mask == _gt_mask]
-            if _inter.size(0) == 0:  # as torch.histc returns error if it gets empty tensor (pytorch 1.5.1)
-                _area_inter = torch.tensor([0, 0], device=_pred_mask.device)
-            else:
-                _area_inter = torch.histc(_inter, bins=2, min=0, max=1)
-            area_inter.append(_area_inter)
-            area_pred.append(torch.histc(_pred_mask, bins=2, min=0, max=1))
-            area_gt.append(torch.histc(_gt_mask, bins=2, min=0, max=1))
-        area_inter = torch.stack(area_inter).t()
-        area_pred = torch.stack(area_pred).t()
-        area_gt = torch.stack(area_gt).t()
+        # compute intersection and union of each episode in a batch (vectorized)
+        pred = pred_mask.view(pred_mask.shape[0], -1)
+        gt = gt_mask.view(gt_mask.shape[0], -1)
+
+        valid = (gt != cls.ignore_index)
+
+        inter_0 = ((pred == 0) & (gt == 0) & valid).sum(dim=1)
+        inter_1 = ((pred == 1) & (gt == 1) & valid).sum(dim=1)
+        area_inter = torch.stack([inter_0, inter_1], dim=0)
+
+        pred_0 = ((pred == 0) & valid).sum(dim=1)
+        pred_1 = ((pred == 1) & valid).sum(dim=1)
+        area_pred = torch.stack([pred_0, pred_1], dim=0)
+
+        gt_0 = ((gt == 0) & valid).sum(dim=1)
+        gt_1 = ((gt == 1) & valid).sum(dim=1)
+        area_gt = torch.stack([gt_0, gt_1], dim=0)
+
         area_union = area_pred + area_gt - area_inter
 
         return area_inter, area_union

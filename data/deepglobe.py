@@ -63,14 +63,14 @@ class DatasetDeepglobe(Dataset):
         query_img = Image.open(query_name).convert('RGB')
         support_imgs = [Image.open(name).convert('RGB') for name in support_names]
 
-        query_id = query_name.split('/')[-1].split('.')[0]
-        ann_path = os.path.join(self.base_path, query_name.split('/')[-4], 'test', 'groundtruth')
-        query_name = os.path.join(ann_path, query_id) + '.png'
-        support_ids = [name.split('/')[-1].split('.')[0] for name in support_names]
-        support_names = [os.path.join(ann_path, sid) + '.png' for name, sid in zip(support_names, support_ids)]
+        query_id = os.path.splitext(os.path.basename(query_name))[0]
+        ann_path = os.path.join(os.path.dirname(os.path.dirname(query_name)), 'groundtruth')
+        query_mask_path = os.path.join(ann_path, query_id) + '.png'
+        support_ids = [os.path.splitext(os.path.basename(name))[0] for name in support_names]
+        support_mask_paths = [os.path.join(ann_path, sid) + '.png' for sid in support_ids]
 
-        query_mask = self.read_mask(query_name)
-        support_masks = [self.read_mask(name) for name in support_names]
+        query_mask = self.read_mask(query_mask_path)
+        support_masks = [self.read_mask(name) for name in support_mask_paths]
 
         return query_img, query_mask, support_imgs, support_masks
 

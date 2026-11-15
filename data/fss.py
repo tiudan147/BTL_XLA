@@ -62,13 +62,13 @@ class DatasetFSS(Dataset):
         query_img = Image.open(query_name).convert('RGB')
         support_imgs = [Image.open(name).convert('RGB') for name in support_names]
 
-        query_id = query_name.split('/')[-1].split('.')[0]
-        query_name = os.path.join(os.path.dirname(query_name), query_id) + '.png'
-        support_ids = [name.split('/')[-1].split('.')[0] for name in support_names]
-        support_names = [os.path.join(os.path.dirname(name), sid) + '.png' for name, sid in zip(support_names, support_ids)]
+        query_id = os.path.splitext(os.path.basename(query_name))[0]
+        query_mask_name = os.path.join(os.path.dirname(query_name), query_id) + '.png'
+        support_ids = [os.path.splitext(os.path.basename(name))[0] for name in support_names]
+        support_mask_names = [os.path.join(os.path.dirname(name), sid) + '.png' for name, sid in zip(support_names, support_ids)]
 
-        query_mask = self.read_mask(query_name)
-        support_masks = [self.read_mask(name) for name in support_names]
+        query_mask = self.read_mask(query_mask_name)
+        support_masks = [self.read_mask(name) for name in support_mask_names]
 
         return query_img, query_mask, support_imgs, support_masks
 
@@ -80,7 +80,8 @@ class DatasetFSS(Dataset):
 
     def sample_episode(self, idx):
         query_name = self.img_metadata[idx]
-        class_sample = self.categories.index(query_name.split('/')[-2])
+        category_name = os.path.basename(os.path.dirname(query_name))
+        class_sample = self.categories.index(category_name)
         if self.split == 'val':
             class_sample += 520
         elif self.split == 'test':

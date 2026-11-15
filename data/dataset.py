@@ -47,6 +47,7 @@ class FSSDataset:
         # Freeze randomness during testing for reproducibility
         #train_sampler = Sampler(dataset) if split == 'trn' else None
         dataloader = DataLoader(dataset, batch_size=bsz, shuffle=split=='trn', num_workers=nworker,
-                                pin_memory=True)
+                                pin_memory=True, persistent_workers=nworker > 0,
+                                prefetch_factor=2 if nworker > 0 else None)
 
         return dataloader

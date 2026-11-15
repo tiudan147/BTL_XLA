@@ -8,6 +8,8 @@ import utils.crfhelper as crfutils
 import core.contrastivehead as ctrutils
 import core.denseaffinity as dautils
 import torch
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 def set_args(_args):
     global args
@@ -16,7 +18,7 @@ def set_args(_args):
 
     # then some more args are appended
     args.backbone = 'resnet50'
-    args.nworker = 4 # tăng số luồng để chạy nhanh hơn
+    args.nworker = 8 # tăng số luồng để chạy nhanh hơn
     args.bsz = 1 # the method works on a single task, hence bsz=1
     args.fold = 0
 
@@ -113,11 +115,10 @@ class SingleSampleEval:
     def forward(self):
         self.taskAdapt()
 
-        self.logit_mask = self.compare_feats()
-
-        self.thresh, self.pred_mask = self.threshold()
-
-        self.pred_mask = self.postprocess()
+        with torch.no_grad():
+            self.logit_mask = self.compare_feats()
+            self.thresh, self.pred_mask = self.threshold()
+            self.pred_mask = self.postprocess()
 
         return self.logit_mask, self.pred_mask
 
