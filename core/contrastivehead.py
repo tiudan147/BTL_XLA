@@ -216,25 +216,63 @@ def keep_var_loss(original_features, transformed_features):
 #-----------------------------------------------------
 #         Vị trí mạng adapter
 #---------------------------------------------------------
-class SimAM(nn.Module):
-    def __init__(self, e_lambda=1e-4):
-        super(SimAM, self).__init__()
-        # Tham số làm trơn để tránh chia cho 0
-        self.e_lambda = e_lambda 
-        self.sigmoid = nn.Sigmoid()
+class SK_Attention(nn.Module):
+    def __init__(self, channels=64, reduction=4):
+        super(SK_Attention, self).__init__()
+        # Nhánh 1: Tầm nhìn hẹp (1x1)
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True)
+        )
+        # Nhánh 2: Tầm nhìn lân cận (3x3 Depthwise)
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Squeeze chung
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        
+        # Excitation chung (FC nén)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Sinh trọng số cho nhánh 1 và nhánh 2
+        self.fcs = nn.ModuleList([
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Linear(channels // reduction, channels, bias=False)
+        ])
+        
+        self.softmax = nn.Softmax(dim=1)
 
     def forward(self, x):
-        b, c, h, w = x.size()
-        n = w * h - 1
+        # 1. Chạy 2 nhánh
+        U1 = self.conv1(x)
+        U2 = self.conv2(x)
         
-        # 1. Đo lường sự khác biệt của từng điểm ảnh so với trung bình của kênh đó
-        x_minus_mu_square = (x - x.mean(dim=[2, 3], keepdim=True)).pow(2)
+        # 2. Cộng gộp để lấy thông tin chung (Squeeze)
+        U = U1 + U2
+        b, c, _, _ = U.size()
+        S = self.global_pool(U).view(b, c)
         
-        # 2. Tính toán hàm năng lượng: Điểm ảnh nào càng nổi bật (phương sai lớn) thì trọng số càng cao
-        y = x_minus_mu_square / (4 * (x_minus_mu_square.sum(dim=[2, 3], keepdim=True) / n + self.e_lambda)) + 0.5
+        # 3. Tính toán véc-tơ Z (Excitation)
+        Z = self.fc(S)
         
-        # 3. Nhân trọng số 3D trở lại đặc trưng gốc
-        return x * self.sigmoid(y)
+        # 4. Tính toán trọng số phân bổ (Attention Weights) cho từng nhánh
+        A_weights = torch.cat([fc(Z).view(b, c, 1) for fc in self.fcs], dim=2) # [B, C, 2]
+        A_weights = self.softmax(A_weights) # Đảm bảo tổng trọng số nhánh 1 + nhánh 2 = 1.0
+        
+        # Lấy mảng trọng số tách rời
+        a_1 = A_weights[:, :, 0].unsqueeze(-1).unsqueeze(-1)
+        a_2 = A_weights[:, :, 1].unsqueeze(-1).unsqueeze(-1)
+        
+        # 5. Trộn 2 nhánh theo trọng số động
+        V = a_1 * U1 + a_2 * U2
+        return V
 
 class ContrastiveFeatureTransformer(nn.Module):
     # def __init__(self, in_channels, config_model):
@@ -273,10 +311,10 @@ class ContrastiveFeatureTransformer(nn.Module):
             nn.ReLU(inplace=True)
         )
         
-        # Bước 2: Chú ý 3D không tham số học (Bảo toàn tuyệt đối không gian HxW)
-        self.simam_block = SimAM(e_lambda=1e-4)
+        # Bước 2: Tự động chọn vùng nhìn lân cận bằng SK-Net
+        self.sk_block = SK_Attention(channels=out_channels, reduction=4)
         
-        # Bước 3: Trộn lại
+        # Bước 3: Trộn lại bằng 1x1
         self.final_conv = nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False)
 
         self.prepend_relu = config_model.prepend_relu
@@ -287,7 +325,7 @@ class ContrastiveFeatureTransformer(nn.Module):
             x = F.relu(x)
             
         x = self.project(x)
-        x = self.simam_block(x)
+        x = self.sk_block(x)
         out = self.final_conv(x)
         
         if self.append_normalize:
