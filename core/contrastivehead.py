@@ -216,40 +216,24 @@ def keep_var_loss(original_features, transformed_features):
 #-----------------------------------------------------
 #         Vị trí mạng adapter
 #---------------------------------------------------------
-class ChannelAttention_SE(nn.Module):
-    # Dùng lại SE block vì nó rất ổn định
-    def __init__(self, channels=64, reduction=4):
-        super(ChannelAttention_SE, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Sequential(
-            nn.Linear(channels, channels // reduction, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(channels // reduction, channels, bias=False),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        b, c, _, _ = x.size()
-        y = self.avg_pool(x).view(b, c)
-        y = self.fc(y).view(b, c, 1, 1)
-        return x * y
-
-class SpatialAttention(nn.Module):
-    def __init__(self):
-        super(SpatialAttention, self).__init__()
-        # Trích xuất 2 bản đồ (Max và Mean) theo chiều kênh, ép về 1 kênh bằng Conv3x3 (chỉ 18 tham số)
-        self.conv = nn.Conv2d(2, 1, kernel_size=3, padding=1, bias=False)
+class SimAM(nn.Module):
+    def __init__(self, e_lambda=1e-4):
+        super(SimAM, self).__init__()
+        # Tham số làm trơn để tránh chia cho 0
+        self.e_lambda = e_lambda 
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        # Ép dọc theo chiều kênh (dim=1)
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        # Nối 2 bản đồ lại (2 kênh)
-        y = torch.cat([avg_out, max_out], dim=1)
-        # Tạo mặt nạ không gian (1 kênh)
-        y = self.conv(y)
-        # Nhân mặt nạ không gian vào đặc trưng
+        b, c, h, w = x.size()
+        n = w * h - 1
+        
+        # 1. Đo lường sự khác biệt của từng điểm ảnh so với trung bình của kênh đó
+        x_minus_mu_square = (x - x.mean(dim=[2, 3], keepdim=True)).pow(2)
+        
+        # 2. Tính toán hàm năng lượng: Điểm ảnh nào càng nổi bật (phương sai lớn) thì trọng số càng cao
+        y = x_minus_mu_square / (4 * (x_minus_mu_square.sum(dim=[2, 3], keepdim=True) / n + self.e_lambda)) + 0.5
+        
+        # 3. Nhân trọng số 3D trở lại đặc trưng gốc
         return x * self.sigmoid(y)
 
 class ContrastiveFeatureTransformer(nn.Module):
@@ -289,13 +273,10 @@ class ContrastiveFeatureTransformer(nn.Module):
             nn.ReLU(inplace=True)
         )
         
-        # Bước 2: Chú ý Kênh (Nhìn CÁI GÌ)
-        self.channel_attention = ChannelAttention_SE(channels=out_channels, reduction=4)
+        # Bước 2: Chú ý 3D không tham số học (Bảo toàn tuyệt đối không gian HxW)
+        self.simam_block = SimAM(e_lambda=1e-4)
         
-        # Bước 3: Chú ý Không gian (Nhìn Ở ĐÂU)
-        self.spatial_attention = SpatialAttention()
-        
-        # Bước 4: Trộn lại
+        # Bước 3: Trộn lại
         self.final_conv = nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False)
 
         self.prepend_relu = config_model.prepend_relu
@@ -306,8 +287,7 @@ class ContrastiveFeatureTransformer(nn.Module):
             x = F.relu(x)
             
         x = self.project(x)
-        x = self.channel_attention(x)
-        x = self.spatial_attention(x)
+        x = self.simam_block(x)
         out = self.final_conv(x)
         
         if self.append_normalize:
