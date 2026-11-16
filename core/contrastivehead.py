@@ -216,42 +216,65 @@ def keep_var_loss(original_features, transformed_features):
 #-----------------------------------------------------
 #         Vị trí mạng adapter
 #---------------------------------------------------------
-class GlobalContextBlock(nn.Module):
-    def __init__(self, in_channels=64, reduction=4):
-        super(GlobalContextBlock, self).__init__()
-        
-        # 1. Context Modeling: Tìm kiếm ngữ cảnh toàn cục (Self-Attention)
-        self.context_conv = nn.Conv2d(in_channels, 1, kernel_size=1, bias=False)
-        
-        # 2. Transform: Nhào nặn ngữ cảnh toàn cục thành trọng số
-        self.transform = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels // reduction, kernel_size=1, bias=False),
-            nn.LayerNorm([in_channels // reduction, 1, 1]), # Dùng LayerNorm thay vì BatchNorm cho Attention
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels // reduction, in_channels, kernel_size=1, bias=False)
+class DualContextAffineBlock(nn.Module):
+    """
+    Sự kết hợp giữa SE-Net (Thử nghiệm 3) và GC-Net (Thử nghiệm 9):
+    1. Dual Squeeze: Kết hợp GAP (bảo vệ Deepglobe) + Softmax Context Attention (bắt khối lớn cho Lung/ISIC).
+    2. Shared LayerNorm Bottleneck: Chuẩn hóa ổn định cho bài toán 1-shot (Batch Size nhỏ).
+    3. Affine Modulation (FiLM): Vừa nhân trọng số kênh (SE Scale) vừa cộng ngữ cảnh toàn cục (GC Shift).
+    """
+    def __init__(self, channels=64, reduction=4):
+        super(DualContextAffineBlock, self).__init__()
+        mid_channels = max(8, channels // reduction)
+
+        # 1. Context Modeling: Nhánh GAP (SE) + Nhánh Self-Attention 1x1 (GC-Net)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.context_conv = nn.Conv2d(channels, 1, kernel_size=1, bias=False)
+
+        # 2. Shared Bottleneck với LayerNorm (giúp hội tụ cực nhanh trong 25 epochs SGD)
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(channels, mid_channels, kernel_size=1, bias=False),
+            nn.LayerNorm([mid_channels, 1, 1]),
+            nn.ReLU(inplace=True)
         )
+
+        # 3a. Nhánh Scale (Multiplicative Gating giống SE -> Tắt kênh nhiễu cho ISIC & Deepglobe)
+        self.fc_scale = nn.Sequential(
+            nn.Conv2d(mid_channels, channels, kernel_size=1, bias=False),
+            nn.Sigmoid()
+        )
+
+        # 3b. Nhánh Shift (Additive Fusion giống GC-Net -> Bơm ngữ cảnh toàn cục cho Lung)
+        self.fc_shift = nn.Conv2d(mid_channels, channels, kernel_size=1, bias=False)
+
+        # Khởi tạo nhánh shift bằng 0 để ban đầu mô hình ổn định tuyệt đối như SE,
+        # sau đó mới học dần lượng ngữ cảnh cộng thêm qua 25 epochs
+        nn.init.zeros_(self.fc_shift.weight)
 
     def forward(self, x):
         b, c, h, w = x.size()
-        
-        # --- BƯỚC 1: Xây dựng bản đồ ngữ cảnh ---
-        # Tính toán mức độ liên quan của từng điểm ảnh (N = H*W)
-        context_mask = self.context_conv(x).view(b, 1, h * w) 
-        context_mask = F.softmax(context_mask, dim=2) # [B, 1, N]
-        
-        # Duỗi đặc trưng gốc ra
-        x_reshaped = x.view(b, c, h * w) # [B, C, N]
-        
-        # Nhân ma trận: Ép N điểm ảnh lại với nhau dựa trên độ liên quan
-        # (B, C, N) nhân (B, N, 1) -> (B, C, 1)
-        global_context = torch.bmm(x_reshaped, context_mask.transpose(1, 2)).unsqueeze(-1) # [B, C, 1, 1]
-        
-        # --- BƯỚC 2: Biến đổi ---
-        transform_out = self.transform(global_context)
-        
-        # --- BƯỚC 3: Hợp nhất (Fusion) ---
-        # Cộng ngữ cảnh toàn cục vào từng điểm ảnh của đặc trưng gốc
-        return x + transform_out
+
+        # --- BƯỚC 1: Gom ngữ cảnh kép (Dual Squeeze) ---
+        # Nhánh 1: Trung bình toàn cục (SE) -> [B, C, 1, 1]
+        gap_context = self.avg_pool(x)
+
+        # Nhánh 2: Chú ý toàn cục (GC-Net) -> [B, C, 1, 1]
+        attn_mask = self.context_conv(x).view(b, 1, h * w)
+        attn_mask = F.softmax(attn_mask, dim=-1) # [B, 1, H*W]
+        x_flat = x.view(b, c, h * w)             # [B, C, H*W]
+        attn_context = torch.bmm(x_flat, attn_mask.transpose(1, 2)).unsqueeze(-1) # [B, C, 1, 1]
+
+        # Hợp nhất 2 nguồn ngữ cảnh
+        global_context = 0.5 * (gap_context + attn_context)
+
+        # --- BƯỚC 2: Nén đặc trưng qua Bottleneck có LayerNorm ---
+        hidden = self.bottleneck(global_context)
+
+        # --- BƯỚC 3: Điều biến Affine (Scale & Shift) ---
+        scale = self.fc_scale(hidden) # Trọng số lọc kênh [0, 1]
+        shift = self.fc_shift(hidden) # Ngữ cảnh cộng thêm
+
+        return x * scale + shift
 
 class ContrastiveFeatureTransformer(nn.Module):
     # def __init__(self, in_channels, config_model):
@@ -280,19 +303,19 @@ class ContrastiveFeatureTransformer(nn.Module):
 
     def __init__(self, in_channels, config_model):
         super(ContrastiveFeatureTransformer, self).__init__()
-        out_channels = config_model.out_channels
-        
-        # Nén kênh
+        out_channels = config_model.out_channels # Mặc định là 64
+
+        # Bước 1: Nén kênh bằng 1x1 Conv (Tuyệt đối không dùng 3x3 để bảo vệ Deepglobe)
         self.project = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True)
         )
-        
-        # Khối Global Context (GC-Net)
-        self.gc_block = GlobalContextBlock(in_channels=out_channels, reduction=4)
-        
-        # Trộn lại
+
+        # Bước 2: Khối Dual-Context Affine (Hợp nhất SE + GC-Net)
+        self.adapter_attention = DualContextAffineBlock(channels=out_channels, reduction=4)
+
+        # Bước 3: Trộn kênh đầu ra bằng 1x1 Conv
         self.final_conv = nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False)
 
         self.prepend_relu = config_model.prepend_relu
@@ -301,14 +324,14 @@ class ContrastiveFeatureTransformer(nn.Module):
     def forward(self, x):
         if self.prepend_relu:
             x = F.relu(x)
-            
+
         x = self.project(x)
-        x = self.gc_block(x)
+        x = self.adapter_attention(x)
         out = self.final_conv(x)
-        
+
         if self.append_normalize:
             out = F.normalize(out, p=2, dim=1)
-            
+
         return out
 
     # fits the model for one semantic class, therefore does not work with batches
