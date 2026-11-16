@@ -217,55 +217,64 @@ def keep_var_loss(original_features, transformed_features):
 #         Vị trí mạng adapter
 #---------------------------------------------------------
 
-class PartialConvolution(nn.Module):
+class SpatialChannelPartialConv(nn.Module):
     def __init__(self, channels=64, ratio=4):
-        super(PartialConvolution, self).__init__()
-        # Trích xuất đúng 1/4 số kênh (25%) để tính toán không gian lân cận
+        super(SpatialChannelPartialConv, self).__init__()
+        # Trích xuất 1/4 số kênh (25%) cho Không gian
         self.cp = channels // ratio 
         
-        # Chỉ tích chập 3x3 trên 25% kênh này
+        # 1. Nhánh Không gian (Spatial) - 25% kênh
         self.spatial_conv = nn.Conv2d(self.cp, self.cp, kernel_size=3, padding=1, bias=False)
+        
+        # 2. Nhánh Kênh (Channel - ECA) - 75% kênh còn lại
+        self.channel_pool = nn.AdaptiveAvgPool2d(1)
+        self.channel_conv = nn.Conv1d(1, 1, kernel_size=3, padding=1, bias=False)
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        # Cắt Tensor làm 2 phần: Phần cần ngữ cảnh (x1) và Phần giữ nguyên độ nét (x2)
+        # Cắt Tensor làm 2 phần: 25% cho Không gian (x1) và 75% cho Kênh (x2)
         x1, x2 = torch.split(x, [self.cp, x.size(1) - self.cp], dim=1)
         
-        # Lấy thông tin hình khối 3x3 cho x1
+        # 1. Xử lý Không gian cho x1
         x1 = self.spatial_conv(x1)
         
-        # Ghép lại với x2 (chưa hề bị đụng chạm)
+        # 2. Xử lý Kênh cho x2 (không làm mờ viền)
+        v = self.channel_pool(x2).squeeze(-1).transpose(-1, -2) # [B, 1, C_rem]
+        v = self.channel_conv(v)
+        v = v.transpose(-1, -2).unsqueeze(-1) # [B, C_rem, 1, 1]
+        x2 = x2 * self.sigmoid(v)
+        
+        # Ghép lại
         return torch.cat((x1, x2), dim=1)
 
-class PCABlock(nn.Module):
+class SPCABlock(nn.Module):
     def __init__(self, channels=64):
-        super(PCABlock, self).__init__()
+        super(SPCABlock, self).__init__()
         
-        # 1. PConv: Lấy ngữ cảnh một phần, bảo toàn độ nét 75%
-        self.pconv = PartialConvolution(channels=channels, ratio=4)
+        # S-PConv: Chia để trị tối thượng (25% Không gian + 75% Kênh)
+        self.spconv = SpatialChannelPartialConv(channels=channels, ratio=4)
         
-        # 2. LayerNorm: Miễn nhiễm hoàn toàn với Few-Shot Batch Size = 1
+        # LayerNorm
         self.norm = nn.LayerNorm(channels, eps=1e-6)
         
-        # 3. Pointwise Conv (1x1): Trộn 25% kênh không gian và 75% kênh nguyên gốc
+        # Pointwise Conv (1x1) để trộn và GELU
         self.pw_conv = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
         self.act = nn.GELU()
 
     def forward(self, x):
         identity = x
         
-        # Bước 1: Trích xuất không gian từng phần
-        x = self.pconv(x)
+        x = self.spconv(x)
         
-        # Bước 2: Chuẩn hóa LayerNorm (yêu cầu chuyển kênh về cuối)
-        x = x.permute(0, 2, 3, 1) # [B, C, H, W] -> [B, H, W, C]
+        # Chuẩn hóa
+        x = x.permute(0, 2, 3, 1)
         x = self.norm(x)
-        x = x.permute(0, 3, 1, 2) # [B, H, W, C] -> [B, C, H, W]
+        x = x.permute(0, 3, 1, 2)
         
-        # Bước 3: Trộn và Kích hoạt
+        # Trộn và Kích hoạt
         x = self.pw_conv(x)
         x = self.act(x)
         
-        # Kết nối tắt
         return identity + x
 
 class ContrastiveFeatureTransformer(nn.Module):
@@ -297,17 +306,14 @@ class ContrastiveFeatureTransformer(nn.Module):
         super(ContrastiveFeatureTransformer, self).__init__()
         out_channels = config_model.out_channels
         
-        # Nén kênh từ ResNet
         self.project = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_channels), 
             nn.ReLU(inplace=True)
         )
         
-        # Khối PCA (Nhanh, bảo vệ viền, ổn định)
-        self.pca_block = PCABlock(channels=out_channels)
+        self.spca_block = SPCABlock(channels=out_channels)
         
-        # Trộn lại đầu ra
         self.final_conv = nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False)
 
         self.prepend_relu = config_model.prepend_relu
@@ -318,7 +324,7 @@ class ContrastiveFeatureTransformer(nn.Module):
             x = F.relu(x)
             
         x = self.project(x)
-        x = self.pca_block(x)
+        x = self.spca_block(x)
         out = self.final_conv(x)
         
         if self.append_normalize:
