@@ -216,30 +216,40 @@ def keep_var_loss(original_features, transformed_features):
 #-----------------------------------------------------
 #         Vị trí mạng adapter
 #---------------------------------------------------------
-class ECA_Layer(nn.Module):
-    def __init__(self, k_size=3):
-        super(ECA_Layer, self).__init__()
-        # Squeeze: Gom không gian HxW thành 1x1
+class ChannelAttention_SE(nn.Module):
+    # Dùng lại SE block vì nó rất ổn định
+    def __init__(self, channels=64, reduction=4):
+        super(ChannelAttention_SE, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        # Excitation: Dùng Conv1D để học tương quan chéo giữa các kênh mà KHÔNG giảm số kênh
-        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y
+
+class SpatialAttention(nn.Module):
+    def __init__(self):
+        super(SpatialAttention, self).__init__()
+        # Trích xuất 2 bản đồ (Max và Mean) theo chiều kênh, ép về 1 kênh bằng Conv3x3 (chỉ 18 tham số)
+        self.conv = nn.Conv2d(2, 1, kernel_size=3, padding=1, bias=False)
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        # x shape: [Batch, Channels, H, W]
-        b, c, h, w = x.size()
-        y = self.avg_pool(x) # [B, C, 1, 1]
-        
-        # Đổi chiều để đưa vào Conv1D: [B, 1, C]
-        y = y.squeeze(-1).transpose(-1, -2) 
-        
-        # Tích chập 1 chiều đánh trọng số
-        y = self.conv(y) 
-        
-        # Trả lại chiều gốc: [B, C, 1, 1]
-        y = y.transpose(-1, -2).unsqueeze(-1) 
-        
-        # Nhân trọng số trở lại
+        # Ép dọc theo chiều kênh (dim=1)
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        # Nối 2 bản đồ lại (2 kênh)
+        y = torch.cat([avg_out, max_out], dim=1)
+        # Tạo mặt nạ không gian (1 kênh)
+        y = self.conv(y)
+        # Nhân mặt nạ không gian vào đặc trưng
         return x * self.sigmoid(y)
 
 class ContrastiveFeatureTransformer(nn.Module):
@@ -270,19 +280,22 @@ class ContrastiveFeatureTransformer(nn.Module):
 
     def __init__(self, in_channels, config_model):
         super(ContrastiveFeatureTransformer, self).__init__()
-        out_channels = config_model.out_channels  # Mặc định là 64
+        out_channels = config_model.out_channels
         
-        # Bước 1: Nén kênh gốc
+        # Bước 1: Nén kênh
         self.project = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True)
         )
         
-        # Bước 2: Khối Chú ý kênh hiệu quả cao (ECA)
-        self.eca_block = ECA_Layer(k_size=3)
+        # Bước 2: Chú ý Kênh (Nhìn CÁI GÌ)
+        self.channel_attention = ChannelAttention_SE(channels=out_channels, reduction=4)
         
-        # Bước 3: Trộn lại bằng 1x1
+        # Bước 3: Chú ý Không gian (Nhìn Ở ĐÂU)
+        self.spatial_attention = SpatialAttention()
+        
+        # Bước 4: Trộn lại
         self.final_conv = nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False)
 
         self.prepend_relu = config_model.prepend_relu
@@ -293,7 +306,8 @@ class ContrastiveFeatureTransformer(nn.Module):
             x = F.relu(x)
             
         x = self.project(x)
-        x = self.eca_block(x)
+        x = self.channel_attention(x)
+        x = self.spatial_attention(x)
         out = self.final_conv(x)
         
         if self.append_normalize:
