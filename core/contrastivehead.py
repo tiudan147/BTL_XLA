@@ -216,51 +216,44 @@ def keep_var_loss(original_features, transformed_features):
 #-----------------------------------------------------
 #         Vị trí mạng adapter
 #---------------------------------------------------------
-class DynamicGroupBlock(nn.Module):
-    def __init__(self, channels=64, groups=4):
-        super(DynamicGroupBlock, self).__init__()
-        self.groups = groups
-        self.group_channels = channels // groups
+
+class ConvNeXtBlock(nn.Module):
+    def __init__(self, dim=64):
+        super(ConvNeXtBlock, self).__init__()
         
-        # Tạo Conv3x3 riêng cho từng nhóm (chạy song song)
-        self.group_convs = nn.ModuleList([
-            nn.Conv2d(self.group_channels, self.group_channels, kernel_size=3, padding=1, bias=False)
-            for _ in range(groups)
-        ])
+        # 1. Depthwise Conv 7x7: Tầm nhìn khổng lồ nhưng không làm mờ chéo kênh
+        self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim, bias=True)
         
-        # Sinh 1 giá trị Gate (0 đến 1) cho MỖI NHÓM để quyết định dùng 3x3 hay giữ 1x1
-        self.gate_generator = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels, groups, kernel_size=1, bias=False),
-            nn.Sigmoid()
-        )
+        # 2. LayerNorm: Miễn nhiễm với Batch Size nhỏ (Tuyệt vời cho Few-shot)
+        self.norm = nn.LayerNorm(dim, eps=1e-6)
+        
+        # 3. Inverted Bottleneck (MLP): Phình to kênh x4 để học tương quan siêu sâu
+        self.pwconv1 = nn.Linear(dim, 4 * dim)
+        self.act = nn.GELU()
+        self.pwconv2 = nn.Linear(4 * dim, dim)
 
     def forward(self, x):
-        b, c, h, w = x.size()
+        input_x = x
         
-        # 1. Chia tensor thành 4 nhóm dọc theo chiều kênh
-        x_split = torch.split(x, self.group_channels, dim=1)
+        # Bước 1: Thu thập ngữ cảnh không gian 7x7
+        x = self.dwconv(x)
         
-        # 2. Sinh 4 giá trị cổng kiểm duyệt [B, 4, 1, 1]
-        gates = self.gate_generator(x) 
+        # Đảo chiều Tensor từ [B, C, H, W] sang [B, H, W, C] để đưa vào LayerNorm và Linear
+        x = x.permute(0, 2, 3, 1)
         
-        out_groups = []
-        for i in range(self.groups):
-            # Lấy đặc trưng của nhóm thứ i
-            xi = x_split[i] 
-            
-            # Lấy cổng tương ứng cho nhóm thứ i
-            gi = gates[:, i:i+1, :, :] 
-            
-            # Tính toán phần viền lân cận (3x3)
-            xi_3x3 = self.group_convs[i](xi)
-            
-            # Trộn: Giữ nguyên xi (như Deepglobe thích) + Cổng * xi_3x3 (như Lung thích)
-            out_i = xi + (gi * xi_3x3)
-            out_groups.append(out_i)
-            
-        # 3. Ghép 4 nhóm lại thành 64 kênh như cũ
-        return torch.cat(out_groups, dim=1)
+        # Bước 2: Chuẩn hóa cực kỳ ổn định
+        x = self.norm(x)
+        
+        # Bước 3: Nhào nặn kênh bằng Pointwise MLP
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.pwconv2(x)
+        
+        # Đảo chiều ngược lại thành [B, C, H, W]
+        x = x.permute(0, 3, 1, 2)
+        
+        # Kết nối tắt (Residual)
+        return input_x + x
 
 class ContrastiveFeatureTransformer(nn.Module):
     # def __init__(self, in_channels, config_model):
@@ -286,24 +279,22 @@ class ContrastiveFeatureTransformer(nn.Module):
     #     if self.append_normalize:
     #         x = F.normalize(x, p=2, dim=1)
     #     return x
-
+    
     def __init__(self, in_channels, config_model):
         super(ContrastiveFeatureTransformer, self).__init__()
         out_channels = config_model.out_channels
         
-        # Nén kênh
+        # Bước 1: Nén kênh từ ResNet
         self.project = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_channels),
+            nn.BatchNorm2d(out_channels), # Giữ lại BN này vì nó nối trực tiếp từ ResNet
             nn.ReLU(inplace=True)
         )
         
-        # Khối Tích chập Nhóm Động (DGC)
-        self.dgc_block = DynamicGroupBlock(channels=out_channels, groups=4)
-        self.bn_dgc = nn.BatchNorm2d(out_channels)
-        self.relu_dgc = nn.ReLU(inplace=True)
+        # Bước 2: Khối ConvNeXt thay thế hoàn toàn Conv1x1/Attention truyền thống
+        self.convnext_block = ConvNeXtBlock(dim=out_channels)
         
-        # Trộn lại
+        # Bước 3: Trộn lại
         self.final_conv = nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False)
 
         self.prepend_relu = config_model.prepend_relu
@@ -314,12 +305,7 @@ class ContrastiveFeatureTransformer(nn.Module):
             x = F.relu(x)
             
         x = self.project(x)
-        
-        # Đi qua DGC và kích hoạt
-        x = self.dgc_block(x)
-        x = self.bn_dgc(x)
-        x = self.relu_dgc(x)
-        
+        x = self.convnext_block(x)
         out = self.final_conv(x)
         
         if self.append_normalize:
