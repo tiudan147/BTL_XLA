@@ -18,3 +18,5 @@ datasets
 demo_outputs/
 logs/
 _demo_exec_test.ipynb
+__pycache__/
+*.pyc
