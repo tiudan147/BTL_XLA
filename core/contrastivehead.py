@@ -378,7 +378,8 @@ class ContrastiveFeatureTransformer(nn.Module):
 #------------------------------------------------
 
             # Aggregate loss
-            loss = qloss + sloss + q_s_loss_diff + proto_loss
+            # loss = qloss + sloss + q_s_loss_diff + proto_loss
+            loss = qloss + sloss + q_s_loss_diff + 1.5 * proto_loss
             assert loss.isfinite().all(), f"invalid contrastive loss:{loss}"
 
             # Backpropagation and optimization
