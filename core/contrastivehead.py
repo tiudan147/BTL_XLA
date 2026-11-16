@@ -216,63 +216,49 @@ def keep_var_loss(original_features, transformed_features):
 #-----------------------------------------------------
 #         Vị trí mạng adapter
 #---------------------------------------------------------
-class SK_Attention(nn.Module):
+class CoordAtt(nn.Module):
     def __init__(self, channels=64, reduction=4):
-        super(SK_Attention, self).__init__()
-        # Nhánh 1: Tầm nhìn hẹp (1x1)
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True)
-        )
-        # Nhánh 2: Tầm nhìn lân cận (3x3 Depthwise)
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True)
-        )
-        
-        # Squeeze chung
-        self.global_pool = nn.AdaptiveAvgPool2d(1)
-        
-        # Excitation chung (FC nén)
-        self.fc = nn.Sequential(
-            nn.Linear(channels, channels // reduction, bias=False),
-            nn.ReLU(inplace=True)
-        )
-        
-        # Sinh trọng số cho nhánh 1 và nhánh 2
-        self.fcs = nn.ModuleList([
-            nn.Linear(channels // reduction, channels, bias=False),
-            nn.Linear(channels // reduction, channels, bias=False)
-        ])
-        
-        self.softmax = nn.Softmax(dim=1)
+        super(CoordAtt, self).__init__()
+        # Gom thông tin theo Trục Y (Chiều cao) và Trục X (Chiều rộng)
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+
+        mip = max(8, channels // reduction)
+
+        # Nén kênh chung
+        self.conv1 = nn.Conv2d(channels, mip, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn1 = nn.BatchNorm2d(mip)
+        self.act = nn.ReLU(inplace=True)
+
+        # Tạo trọng số chú ý riêng cho trục Y và trục X
+        self.conv_h = nn.Conv2d(mip, channels, kernel_size=1, stride=1, padding=0, bias=False)
+        self.conv_w = nn.Conv2d(mip, channels, kernel_size=1, stride=1, padding=0, bias=False)
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        # 1. Chạy 2 nhánh
-        U1 = self.conv1(x)
-        U2 = self.conv2(x)
+        n, c, h, w = x.size()
         
-        # 2. Cộng gộp để lấy thông tin chung (Squeeze)
-        U = U1 + U2
-        b, c, _, _ = U.size()
-        S = self.global_pool(U).view(b, c)
-        
-        # 3. Tính toán véc-tơ Z (Excitation)
-        Z = self.fc(S)
-        
-        # 4. Tính toán trọng số phân bổ (Attention Weights) cho từng nhánh
-        A_weights = torch.cat([fc(Z).view(b, c, 1) for fc in self.fcs], dim=2) # [B, C, 2]
-        A_weights = self.softmax(A_weights) # Đảm bảo tổng trọng số nhánh 1 + nhánh 2 = 1.0
-        
-        # Lấy mảng trọng số tách rời
-        a_1 = A_weights[:, :, 0].unsqueeze(-1).unsqueeze(-1)
-        a_2 = A_weights[:, :, 1].unsqueeze(-1).unsqueeze(-1)
-        
-        # 5. Trộn 2 nhánh theo trọng số động
-        V = a_1 * U1 + a_2 * U2
-        return V
+        # Bước 1: Trích xuất tọa độ không gian (Ép ảnh thành 2 dải 1D)
+        x_h = self.pool_h(x)                   # [n, c, h, 1]
+        x_w = self.pool_w(x).permute(0, 1, 3, 2) # Đảo chiều w lên: [n, c, w, 1]
+
+        # Bước 2: Nối 2 dải lại và cho học tương quan chéo bằng Conv 1x1
+        y = torch.cat([x_h, x_w], dim=2)       # [n, c, h+w, 1]
+        y = self.conv1(y)
+        y = self.bn1(y)
+        y = self.act(y)
+
+        # Bước 3: Tách dải ra trả về đúng kích thước trục Y và trục X
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)          # Trả lại chiều: [n, c, 1, w]
+
+        # Bước 4: Chuyển thành mặt nạ xác suất (0 đến 1)
+        a_h = self.sigmoid(self.conv_h(x_h))
+        a_w = self.sigmoid(self.conv_w(x_w))
+
+        # Bước 5: Nhân mặt nạ dọc và mặt nạ ngang vào đặc trưng gốc
+        out = x * a_h * a_w
+        return out
 
 class ContrastiveFeatureTransformer(nn.Module):
     # def __init__(self, in_channels, config_model):
@@ -304,17 +290,17 @@ class ContrastiveFeatureTransformer(nn.Module):
         super(ContrastiveFeatureTransformer, self).__init__()
         out_channels = config_model.out_channels
         
-        # Bước 1: Nén kênh
+        # Nén kênh gốc
         self.project = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True)
         )
         
-        # Bước 2: Tự động chọn vùng nhìn lân cận bằng SK-Net
-        self.sk_block = SK_Attention(channels=out_channels, reduction=4)
+        # Khối Coordinate Attention (Nhẹ, Nhanh, Giữ được tọa độ không gian)
+        self.coord_block = CoordAtt(channels=out_channels, reduction=4)
         
-        # Bước 3: Trộn lại bằng 1x1
+        # Trộn lại bằng 1x1
         self.final_conv = nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False)
 
         self.prepend_relu = config_model.prepend_relu
@@ -325,14 +311,13 @@ class ContrastiveFeatureTransformer(nn.Module):
             x = F.relu(x)
             
         x = self.project(x)
-        x = self.sk_block(x)
+        x = self.coord_block(x)
         out = self.final_conv(x)
         
         if self.append_normalize:
             out = F.normalize(out, p=2, dim=1)
             
         return out
-
 
     # fits the model for one semantic class, therefore does not work with batches
     # mapped_qfeat_vol, aug_qfeat_vols: [aug,c,h,w]

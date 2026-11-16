@@ -36,7 +36,7 @@ def makeConfig():
     config.fitting.symmetricloss = False
     config.fitting.q_nceloss = True
     config.fitting.s_nceloss = True
-    config.fitting.num_epochs = 10 # 25
+    config.fitting.num_epochs = 25
     config.fitting.lr = 1e-2
     config.fitting.debug = args.verbosity > 2
     config.model.out_channels = 64
