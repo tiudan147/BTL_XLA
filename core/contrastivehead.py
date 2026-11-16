@@ -216,32 +216,52 @@ def keep_var_loss(original_features, transformed_features):
 #-----------------------------------------------------
 #         Vị trí mạng adapter
 #---------------------------------------------------------
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-class NAM_ChannelAttention(nn.Module):
-    def __init__(self, channels):
-        super(NAM_ChannelAttention, self).__init__()
-        # Tạo một lớp BatchNorm2d riêng để lấy trọng số Gamma (Scale)
-        self.bn = nn.BatchNorm2d(channels)
-        self.sigmoid = nn.Sigmoid()
+class DynamicGroupBlock(nn.Module):
+    def __init__(self, channels=64, groups=4):
+        super(DynamicGroupBlock, self).__init__()
+        self.groups = groups
+        self.group_channels = channels // groups
+        
+        # Tạo Conv3x3 riêng cho từng nhóm (chạy song song)
+        self.group_convs = nn.ModuleList([
+            nn.Conv2d(self.group_channels, self.group_channels, kernel_size=3, padding=1, bias=False)
+            for _ in range(groups)
+        ])
+        
+        # Sinh 1 giá trị Gate (0 đến 1) cho MỖI NHÓM để quyết định dùng 3x3 hay giữ 1x1
+        self.gate_generator = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, groups, kernel_size=1, bias=False),
+            nn.Sigmoid()
+        )
 
     def forward(self, x):
-        # 1. Chuẩn hóa đặc trưng
-        out = self.bn(x)
+        b, c, h, w = x.size()
         
-        # 2. Lấy trọng số Gamma (Scale) từ BatchNorm
-        # shape của bn.weight là [C]. Ta view nó thành [1, C, 1, 1] để nhân broadcasting
-        weight = self.bn.weight.view(1, -1, 1, 1)
+        # 1. Chia tensor thành 4 nhóm dọc theo chiều kênh
+        x_split = torch.split(x, self.group_channels, dim=1)
         
-        # 3. Tính tỷ lệ trọng số Gamma so với tổng các Gamma
-        # Kênh nào có độ biến thiên cao sẽ được nhận hệ số lớn hơn
-        normalized_weight = weight / (torch.sum(torch.abs(weight)) + 1e-5)
+        # 2. Sinh 4 giá trị cổng kiểm duyệt [B, 4, 1, 1]
+        gates = self.gate_generator(x) 
         
-        # 4. Nhân trọng số trở lại bản đồ đặc trưng (Attention)
-        out = x * self.sigmoid(normalized_weight)
-        return out
+        out_groups = []
+        for i in range(self.groups):
+            # Lấy đặc trưng của nhóm thứ i
+            xi = x_split[i] 
+            
+            # Lấy cổng tương ứng cho nhóm thứ i
+            gi = gates[:, i:i+1, :, :] 
+            
+            # Tính toán phần viền lân cận (3x3)
+            xi_3x3 = self.group_convs[i](xi)
+            
+            # Trộn: Giữ nguyên xi (như Deepglobe thích) + Cổng * xi_3x3 (như Lung thích)
+            out_i = xi + (gi * xi_3x3)
+            out_groups.append(out_i)
+            
+        # 3. Ghép 4 nhóm lại thành 64 kênh như cũ
+        return torch.cat(out_groups, dim=1)
+
 class ContrastiveFeatureTransformer(nn.Module):
     # def __init__(self, in_channels, config_model):
     #     super(ContrastiveFeatureTransformer, self).__init__()
@@ -271,15 +291,19 @@ class ContrastiveFeatureTransformer(nn.Module):
         super(ContrastiveFeatureTransformer, self).__init__()
         out_channels = config_model.out_channels
         
-        # Bước 1: Nén kênh bằng Conv1x1
-        self.project_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+        # Nén kênh
+        self.project = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
         
-        # Bước 2: Tích hợp NAM Attention ngay sau Conv1x1 (Nó kiêm luôn vai trò của BatchNorm)
-        self.nam_block = NAM_ChannelAttention(channels=out_channels)
+        # Khối Tích chập Nhóm Động (DGC)
+        self.dgc_block = DynamicGroupBlock(channels=out_channels, groups=4)
+        self.bn_dgc = nn.BatchNorm2d(out_channels)
+        self.relu_dgc = nn.ReLU(inplace=True)
         
-        self.relu = nn.ReLU(inplace=True)
-        
-        # Bước 3: Trộn lại
+        # Trộn lại
         self.final_conv = nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False)
 
         self.prepend_relu = config_model.prepend_relu
@@ -289,9 +313,12 @@ class ContrastiveFeatureTransformer(nn.Module):
         if self.prepend_relu:
             x = F.relu(x)
             
-        x = self.project_conv(x)
-        x = self.nam_block(x)
-        x = self.relu(x)
+        x = self.project(x)
+        
+        # Đi qua DGC và kích hoạt
+        x = self.dgc_block(x)
+        x = self.bn_dgc(x)
+        x = self.relu_dgc(x)
         
         out = self.final_conv(x)
         
