@@ -246,32 +246,44 @@ class ContrastiveFeatureTransformer(nn.Module):
     def __init__(self, in_channels, config_model):
         super(ContrastiveFeatureTransformer, self).__init__()
         out_channels = config_model.out_channels  # Mặc định là 64
-        # Bước 1: Nén kênh từ ResNet (256/512/1024/2048) về 64 kênh bằng 1x1 Conv
+        
+        # 1. Nhánh nén ban đầu (Dùng chung)
         self.project = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True)
         )
-        # Bước 2: Học ngữ cảnh lân cận 3x3 siêu nhẹ bằng Depthwise Separable Conv
-        self.spatial_conv = nn.Sequential(
-            # Depthwise conv 3x3: nhóm riêng theo từng kênh (cực nhẹ)
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, groups=out_channels, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            # Pointwise conv 1x1: kết hợp lại các kênh
-            nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False)
+        
+        # 2. Hai nhánh phân tích song song
+        # - Nhánh A: Chỉ nhìn từng pixel (1x1), giữ chi tiết mảnh, tốt cho Deepglobe
+        self.branch_local = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels)
         )
+        
+        # - Nhánh B: Nhìn lân cận (3x3 Depthwise), tốt cho ISIC, Lung
+        self.branch_spatial = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, groups=out_channels, bias=False),
+            nn.BatchNorm2d(out_channels)
+        )
+        
+        # 3. Kích hoạt chung sau khi cộng
+        self.final_relu = nn.ReLU(inplace=True)
+
         self.prepend_relu = config_model.prepend_relu
         self.append_normalize = config_model.append_normalize
+
     def forward(self, x):
         if self.prepend_relu:
             x = F.relu(x)
             
-        # 1. Nén đặc trưng
+        # Nén kênh chung
         x_proj = self.project(x)
         
-        # 2. Cộng kết nối tắt (Residual Connection): đặc trưng gốc + tinh chỉnh không gian
-        out = x_proj + self.spatial_conv(x_proj)
+        # Đi qua 2 nhánh và cộng gộp (Fusion)
+        out_local = self.branch_local(x_proj)
+        out_spatial = self.branch_spatial(x_proj)
+        out = self.final_relu(out_local + out_spatial)
         
         if self.append_normalize:
             out = F.normalize(out, p=2, dim=1)
