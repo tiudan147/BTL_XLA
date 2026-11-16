@@ -16,7 +16,7 @@ def set_args(_args):
 
     # then some more args are appended
     args.backbone = 'resnet50'
-    args.nworker = 0
+    args.nworker = 4 # tăng số luồng để chạy nhanh hơn
     args.bsz = 1 # the method works on a single task, hence bsz=1
     args.fold = 0
 
