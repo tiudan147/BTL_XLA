@@ -88,6 +88,9 @@ class ContrastiveConfig:
     def __repr__(self):
         return str(self._data)
 
+#------------------------------------------------
+#            Nơi định nghĩa hàm loss Lq, Ls
+#------------------------------------------------
 
 def dense_info_nce_loss(original_features, transformed_features, config_nce):
     B, C, H, W = transformed_features.shape
@@ -154,6 +157,9 @@ def self_attention_loss(f_base, f_transformed, mask_base, mask_transformed, k, a
     loss = torch.nn.BCELoss()(pred_map.float(), pseudoquerymask.float())
     return loss.mean()
 
+#------------------------------------------------
+#            Nơi định nghĩa hàm loss Lp
+#------------------------------------------------
 
 # features of base, transformed: [b,c,h,w]
 # if base features are aligned with transformed features, pass both same
@@ -205,30 +211,73 @@ def keep_var_loss(original_features, transformed_features):
         vardiff).mean()  # [k*aug,c] -> [scalar] or  [aug,c] -> [scalar]
     return keepvarloss
 
+
+
+#-----------------------------------------------------
+#         Vị trí mạng adapter
+#---------------------------------------------------------
+
 class ContrastiveFeatureTransformer(nn.Module):
+    # def __init__(self, in_channels, config_model):
+    #     super(ContrastiveFeatureTransformer, self).__init__()
+
+    #     out_channels, kernel_size = config_model.out_channels, config_model.kernel_size
+    #     # Add a convolutional layer and a batch normalization layer for learning
+    #     self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, padding=(kernel_size - 1) // 2)
+    #     self.bn = nn.BatchNorm2d(out_channels)
+    #     self.linear = nn.Conv2d(out_channels, out_channels, 1)
+
+    #     self.prepend_relu = config_model.prepend_relu
+    #     self.append_normalize = config_model.append_normalize
+    #     #self.debug = config_model.debug
+
+    # def forward(self, x):
+    #     if self.prepend_relu:
+    #         x = nn.ReLU()(x)
+    #     x = self.conv(x)
+    #     x = self.bn(x)
+    #     x = nn.ReLU()(x)
+    #     x = self.linear(x)
+    #     if self.append_normalize:
+    #         x = F.normalize(x, p=2, dim=1)
+    #     return x
+
+
     def __init__(self, in_channels, config_model):
         super(ContrastiveFeatureTransformer, self).__init__()
-
-        out_channels, kernel_size = config_model.out_channels, config_model.kernel_size
-        # Add a convolutional layer and a batch normalization layer for learning
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, padding=(kernel_size - 1) // 2)
-        self.bn = nn.BatchNorm2d(out_channels)
-        self.linear = nn.Conv2d(out_channels, out_channels, 1)
-
+        out_channels = config_model.out_channels  # Mặc định là 64
+        # Bước 1: Nén kênh từ ResNet (256/512/1024/2048) về 64 kênh bằng 1x1 Conv
+        self.project = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+        # Bước 2: Học ngữ cảnh lân cận 3x3 siêu nhẹ bằng Depthwise Separable Conv
+        self.spatial_conv = nn.Sequential(
+            # Depthwise conv 3x3: nhóm riêng theo từng kênh (cực nhẹ)
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, groups=out_channels, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            # Pointwise conv 1x1: kết hợp lại các kênh
+            nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False)
+        )
         self.prepend_relu = config_model.prepend_relu
         self.append_normalize = config_model.append_normalize
-        #self.debug = config_model.debug
-
     def forward(self, x):
         if self.prepend_relu:
-            x = nn.ReLU()(x)
-        x = self.conv(x)
-        x = self.bn(x)
-        x = nn.ReLU()(x)
-        x = self.linear(x)
+            x = F.relu(x)
+            
+        # 1. Nén đặc trưng
+        x_proj = self.project(x)
+        
+        # 2. Cộng kết nối tắt (Residual Connection): đặc trưng gốc + tinh chỉnh không gian
+        out = x_proj + self.spatial_conv(x_proj)
+        
         if self.append_normalize:
-            x = F.normalize(x, p=2, dim=1)
-        return x
+            out = F.normalize(out, p=2, dim=1)
+            
+        return out
+
 
     # fits the model for one semantic class, therefore does not work with batches
     # mapped_qfeat_vol, aug_qfeat_vols: [aug,c,h,w]
@@ -291,6 +340,10 @@ class ContrastiveFeatureTransformer(nn.Module):
 
             # 3. do not let only one image fit well - regularization
             q_s_loss_diff = torch.abs(qloss - sloss) if config_fit.symmetricloss else 0
+
+#------------------------------------------------
+#            Nơi tổng hợp loss
+#------------------------------------------------
 
             # Aggregate loss
             loss = qloss + sloss + q_s_loss_diff + proto_loss
