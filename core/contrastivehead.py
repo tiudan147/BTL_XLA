@@ -217,65 +217,51 @@ def keep_var_loss(original_features, transformed_features):
 #         Vị trí mạng adapter
 #---------------------------------------------------------
 
-class SpatialChannelPartialConv(nn.Module):
-    def __init__(self, channels=64, ratio=4):
-        super(SpatialChannelPartialConv, self).__init__()
-        # Trích xuất 1/4 số kênh (25%) cho Không gian
-        self.cp = channels // ratio 
-        
-        # 1. Nhánh Không gian (Spatial) - 25% kênh
-        self.spatial_conv = nn.Conv2d(self.cp, self.cp, kernel_size=3, padding=1, bias=False)
-        
-        # 2. Nhánh Kênh (Channel - ECA) - 75% kênh còn lại
-        self.channel_pool = nn.AdaptiveAvgPool2d(1)
-        self.channel_conv = nn.Conv1d(1, 1, kernel_size=3, padding=1, bias=False)
-        self.sigmoid = nn.Sigmoid()
-
+class SimpleGate(nn.Module):
     def forward(self, x):
-        # Cắt Tensor làm 2 phần: 25% cho Không gian (x1) và 75% cho Kênh (x2)
-        x1, x2 = torch.split(x, [self.cp, x.size(1) - self.cp], dim=1)
-        
-        # 1. Xử lý Không gian cho x1
-        x1 = self.spatial_conv(x1)
-        
-        # 2. Xử lý Kênh cho x2 (không làm mờ viền)
-        v = self.channel_pool(x2).squeeze(-1).transpose(-1, -2) # [B, 1, C_rem]
-        v = self.channel_conv(v)
-        v = v.transpose(-1, -2).unsqueeze(-1) # [B, C_rem, 1, 1]
-        x2 = x2 * self.sigmoid(v)
-        
-        # Ghép lại
-        return torch.cat((x1, x2), dim=1)
+        # Cắt đôi Tensor theo chiều kênh
+        x1, x2 = x.chunk(2, dim=1)
+        # Nửa này làm mặt nạ Attention động cho nửa kia (0 tham số học, 0 làm mờ)
+        return x1 * x2
 
-class SPCABlock(nn.Module):
+class NAFBlock(nn.Module):
     def __init__(self, channels=64):
-        super(SPCABlock, self).__init__()
+        super(NAFBlock, self).__init__()
         
-        # S-PConv: Chia để trị tối thượng (25% Không gian + 75% Kênh)
-        self.spconv = SpatialChannelPartialConv(channels=channels, ratio=4)
-        
-        # LayerNorm
+        # 1. LayerNorm: Vua ổn định, triệt tiêu nhiễu loạn của Few-Shot (Batch Size = 1)
         self.norm = nn.LayerNorm(channels, eps=1e-6)
         
-        # Pointwise Conv (1x1) để trộn và GELU
-        self.pw_conv = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.act = nn.GELU()
+        # 2. Conv1x1 mở rộng kênh gấp đôi (để chuẩn bị cho SimpleGate)
+        self.conv1 = nn.Conv2d(channels, channels * 2, kernel_size=1, bias=False)
+        
+        # 3. Depthwise 3x3: Lấy hình khối cho Lung/ISIC nhưng KHÔNG trộn kênh để bảo vệ Deepglobe
+        self.dw_conv = nn.Conv2d(channels * 2, channels * 2, kernel_size=3, padding=1, groups=channels * 2, bias=False)
+        
+        # 4. Cổng ma thuật NAF (Thay thế hoàn toàn Attention, ReLU, Sigmoid)
+        self.sg = SimpleGate()
+        
+        # 5. Conv1x1: Gom đặc trưng sắc nét trả về
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
 
     def forward(self, x):
         identity = x
         
-        x = self.spconv(x)
+        # Bước 1: Chuẩn hóa LayerNorm (Chuyển kênh về cuối để tính, rồi trả lại)
+        out = x.permute(0, 2, 3, 1)
+        out = self.norm(out)
+        out = out.permute(0, 3, 1, 2)
         
-        # Chuẩn hóa
-        x = x.permute(0, 2, 3, 1)
-        x = self.norm(x)
-        x = x.permute(0, 3, 1, 2)
+        # Bước 2: Tích chập mở rộng và thu thập ngữ cảnh 3x3
+        out = self.conv1(out)
+        out = self.dw_conv(out)
         
-        # Trộn và Kích hoạt
-        x = self.pw_conv(x)
-        x = self.act(x)
+        # Bước 3: Phép nhân SimpleGate (Tuyệt kỹ phân tách nền/vật thể mà không cần Pooling)
+        out = self.sg(out)
         
-        return identity + x
+        # Bước 4: Khôi phục và cộng Residual
+        out = self.conv2(out)
+        
+        return identity + out
 
 class ContrastiveFeatureTransformer(nn.Module):
     # def __init__(self, in_channels, config_model):
@@ -306,14 +292,17 @@ class ContrastiveFeatureTransformer(nn.Module):
         super(ContrastiveFeatureTransformer, self).__init__()
         out_channels = config_model.out_channels
         
+        # Nén kênh từ ResNet
         self.project = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_channels), 
             nn.ReLU(inplace=True)
         )
         
-        self.spca_block = SPCABlock(channels=out_channels)
+        # Khối NAFBlock - Đỉnh cao của sự đơn giản và bảo toàn đặc trưng
+        self.naf_block = NAFBlock(channels=out_channels)
         
+        # Trộn lại
         self.final_conv = nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False)
 
         self.prepend_relu = config_model.prepend_relu
@@ -324,7 +313,7 @@ class ContrastiveFeatureTransformer(nn.Module):
             x = F.relu(x)
             
         x = self.project(x)
-        x = self.spca_block(x)
+        x = self.naf_block(x)
         out = self.final_conv(x)
         
         if self.append_normalize:
