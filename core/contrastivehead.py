@@ -216,49 +216,42 @@ def keep_var_loss(original_features, transformed_features):
 #-----------------------------------------------------
 #         Vị trí mạng adapter
 #---------------------------------------------------------
-class CoordAtt(nn.Module):
-    def __init__(self, channels=64, reduction=4):
-        super(CoordAtt, self).__init__()
-        # Gom thông tin theo Trục Y (Chiều cao) và Trục X (Chiều rộng)
-        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
-        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
-
-        mip = max(8, channels // reduction)
-
-        # Nén kênh chung
-        self.conv1 = nn.Conv2d(channels, mip, kernel_size=1, stride=1, padding=0, bias=False)
-        self.bn1 = nn.BatchNorm2d(mip)
-        self.act = nn.ReLU(inplace=True)
-
-        # Tạo trọng số chú ý riêng cho trục Y và trục X
-        self.conv_h = nn.Conv2d(mip, channels, kernel_size=1, stride=1, padding=0, bias=False)
-        self.conv_w = nn.Conv2d(mip, channels, kernel_size=1, stride=1, padding=0, bias=False)
-        self.sigmoid = nn.Sigmoid()
+class GlobalContextBlock(nn.Module):
+    def __init__(self, in_channels=64, reduction=4):
+        super(GlobalContextBlock, self).__init__()
+        
+        # 1. Context Modeling: Tìm kiếm ngữ cảnh toàn cục (Self-Attention)
+        self.context_conv = nn.Conv2d(in_channels, 1, kernel_size=1, bias=False)
+        
+        # 2. Transform: Nhào nặn ngữ cảnh toàn cục thành trọng số
+        self.transform = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels // reduction, kernel_size=1, bias=False),
+            nn.LayerNorm([in_channels // reduction, 1, 1]), # Dùng LayerNorm thay vì BatchNorm cho Attention
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels // reduction, in_channels, kernel_size=1, bias=False)
+        )
 
     def forward(self, x):
-        n, c, h, w = x.size()
+        b, c, h, w = x.size()
         
-        # Bước 1: Trích xuất tọa độ không gian (Ép ảnh thành 2 dải 1D)
-        x_h = self.pool_h(x)                   # [n, c, h, 1]
-        x_w = self.pool_w(x).permute(0, 1, 3, 2) # Đảo chiều w lên: [n, c, w, 1]
-
-        # Bước 2: Nối 2 dải lại và cho học tương quan chéo bằng Conv 1x1
-        y = torch.cat([x_h, x_w], dim=2)       # [n, c, h+w, 1]
-        y = self.conv1(y)
-        y = self.bn1(y)
-        y = self.act(y)
-
-        # Bước 3: Tách dải ra trả về đúng kích thước trục Y và trục X
-        x_h, x_w = torch.split(y, [h, w], dim=2)
-        x_w = x_w.permute(0, 1, 3, 2)          # Trả lại chiều: [n, c, 1, w]
-
-        # Bước 4: Chuyển thành mặt nạ xác suất (0 đến 1)
-        a_h = self.sigmoid(self.conv_h(x_h))
-        a_w = self.sigmoid(self.conv_w(x_w))
-
-        # Bước 5: Nhân mặt nạ dọc và mặt nạ ngang vào đặc trưng gốc
-        out = x * a_h * a_w
-        return out
+        # --- BƯỚC 1: Xây dựng bản đồ ngữ cảnh ---
+        # Tính toán mức độ liên quan của từng điểm ảnh (N = H*W)
+        context_mask = self.context_conv(x).view(b, 1, h * w) 
+        context_mask = F.softmax(context_mask, dim=2) # [B, 1, N]
+        
+        # Duỗi đặc trưng gốc ra
+        x_reshaped = x.view(b, c, h * w) # [B, C, N]
+        
+        # Nhân ma trận: Ép N điểm ảnh lại với nhau dựa trên độ liên quan
+        # (B, C, N) nhân (B, N, 1) -> (B, C, 1)
+        global_context = torch.bmm(x_reshaped, context_mask.transpose(1, 2)).unsqueeze(-1) # [B, C, 1, 1]
+        
+        # --- BƯỚC 2: Biến đổi ---
+        transform_out = self.transform(global_context)
+        
+        # --- BƯỚC 3: Hợp nhất (Fusion) ---
+        # Cộng ngữ cảnh toàn cục vào từng điểm ảnh của đặc trưng gốc
+        return x + transform_out
 
 class ContrastiveFeatureTransformer(nn.Module):
     # def __init__(self, in_channels, config_model):
@@ -285,22 +278,21 @@ class ContrastiveFeatureTransformer(nn.Module):
     #         x = F.normalize(x, p=2, dim=1)
     #     return x
 
-
     def __init__(self, in_channels, config_model):
         super(ContrastiveFeatureTransformer, self).__init__()
         out_channels = config_model.out_channels
         
-        # Nén kênh gốc
+        # Nén kênh
         self.project = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True)
         )
         
-        # Khối Coordinate Attention (Nhẹ, Nhanh, Giữ được tọa độ không gian)
-        self.coord_block = CoordAtt(channels=out_channels, reduction=4)
+        # Khối Global Context (GC-Net)
+        self.gc_block = GlobalContextBlock(in_channels=out_channels, reduction=4)
         
-        # Trộn lại bằng 1x1
+        # Trộn lại
         self.final_conv = nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False)
 
         self.prepend_relu = config_model.prepend_relu
@@ -311,7 +303,7 @@ class ContrastiveFeatureTransformer(nn.Module):
             x = F.relu(x)
             
         x = self.project(x)
-        x = self.coord_block(x)
+        x = self.gc_block(x)
         out = self.final_conv(x)
         
         if self.append_normalize:
