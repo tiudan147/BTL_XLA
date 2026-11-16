@@ -62,8 +62,8 @@ class DatasetSUIM(Dataset):
 
     def load_frame(self, query_mask_path, support_mask_paths):
         def maskpath_to_imgpath(maskpath):
-            filename, imgext = maskpath.split('/')[-1].split('.')[0], '.jpg'
-            return os.path.join(self.img_path, filename) + imgext
+            filename = os.path.splitext(os.path.basename(maskpath))[0]
+            return os.path.join(self.img_path, filename) + '.jpg'
 
         query_img = Image.open(maskpath_to_imgpath(query_mask_path)).convert('RGB')
 

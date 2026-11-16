@@ -28,10 +28,14 @@ class Backbone(nn.Module):
 
         self.cross_entropy_loss = nn.CrossEntropyLoss()
 
+    @torch.no_grad()
     def extract_feats(self, img):
         r""" Extract input image features """
         feats = []
         bottleneck_ids = reduce(add, list(map(lambda x: list(range(x)), self.nlayers)))
+        # Cache layer references to avoid repeated string formatting and __getattr__ lookups
+        layers = [self.feature_extractor.layer1, self.feature_extractor.layer2,
+                  self.feature_extractor.layer3, self.feature_extractor.layer4]
         # Layer 0
         feat = self.feature_extractor.conv1.forward(img)
         feat = self.feature_extractor.bn1.forward(feat)
@@ -40,24 +44,25 @@ class Backbone(nn.Module):
 
         # Layer 1-4
         for hid, (bid, lid) in enumerate(zip(bottleneck_ids, self.lids)):
+            block = layers[lid - 1][bid]
             res = feat
-            feat = self.feature_extractor.__getattr__('layer%d' % lid)[bid].conv1.forward(feat)
-            feat = self.feature_extractor.__getattr__('layer%d' % lid)[bid].bn1.forward(feat)
-            feat = self.feature_extractor.__getattr__('layer%d' % lid)[bid].relu.forward(feat)
-            feat = self.feature_extractor.__getattr__('layer%d' % lid)[bid].conv2.forward(feat)
-            feat = self.feature_extractor.__getattr__('layer%d' % lid)[bid].bn2.forward(feat)
-            feat = self.feature_extractor.__getattr__('layer%d' % lid)[bid].relu.forward(feat)
-            feat = self.feature_extractor.__getattr__('layer%d' % lid)[bid].conv3.forward(feat)
-            feat = self.feature_extractor.__getattr__('layer%d' % lid)[bid].bn3.forward(feat)
+            feat = block.conv1.forward(feat)
+            feat = block.bn1.forward(feat)
+            feat = block.relu.forward(feat)
+            feat = block.conv2.forward(feat)
+            feat = block.bn2.forward(feat)
+            feat = block.relu.forward(feat)
+            feat = block.conv3.forward(feat)
+            feat = block.bn3.forward(feat)
 
             if bid == 0:
-                res = self.feature_extractor.__getattr__('layer%d' % lid)[bid].downsample.forward(res)
+                res = block.downsample.forward(res)
 
             feat += res
 
             if hid + 1 in self.feat_ids:
-                feats.append(feat.clone())
+                feats.append(feat)
 
-            feat = self.feature_extractor.__getattr__('layer%d' % lid)[bid].relu.forward(feat)
+            feat = block.relu.forward(feat)
 
         return feats

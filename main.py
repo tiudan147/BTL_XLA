@@ -29,11 +29,18 @@ if __name__ == '__main__':
     feat_maker = runner.makeFeatureMaker(dataloader.dataset, config, device=device)
     average_meter = runner.AverageMeterWrapper(dataloader, device)
 
+    import time
+    total_time = 0
     for idx, batch in enumerate(dataloader):
+        start = time.time()
         sseval = runner.SingleSampleEval(batch, feat_maker)
         sseval.post_proc_method = args.postprocessing
         sseval.forward()
         sseval.calc_metrics()
+        elapsed = time.time() - start
+        total_time += elapsed
         average_meter.update(sseval)
         average_meter.write(idx)
-    print('Result m|FB:', average_meter.average_meter.compute_iou())
+    miou, fb_iou = average_meter.average_meter.compute_iou()
+    print(f'Result mIoU: {miou:.2f} | FB-IoU: {fb_iou:.2f}')
+    print(f'Total time: {total_time:.1f}s | Avg per episode: {total_time/(idx+1):.3f}s')

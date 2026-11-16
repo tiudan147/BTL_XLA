@@ -3,7 +3,16 @@ import datetime
 import logging
 import os
 
-from tensorboardX import SummaryWriter
+try:
+    from tensorboardX import SummaryWriter
+except ImportError:
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except ImportError:
+        class SummaryWriter:
+            def __init__(self, *args, **kwargs): pass
+            def add_scalar(self, *args, **kwargs): pass
+            def close(self): pass
 import torch
 
 class AverageMeter:
