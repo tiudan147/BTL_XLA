@@ -217,39 +217,51 @@ def keep_var_loss(original_features, transformed_features):
 #         Vị trí mạng adapter
 #---------------------------------------------------------
 
-class LCFAttention(nn.Module):
+class SimpleGate(nn.Module):
+    def forward(self, x):
+        # Cắt đôi Tensor theo chiều kênh
+        x1, x2 = x.chunk(2, dim=1)
+        # Nửa này làm mặt nạ Attention động cho nửa kia (0 tham số học, 0 làm mờ)
+        return x1 * x2
+
+class NAFBlock(nn.Module):
     def __init__(self, channels=64):
-        super(LCFAttention, self).__init__()
+        super(NAFBlock, self).__init__()
         
-        # 1. Depthwise 3x3: Chiều chuộng Lung/ISIC (Lấy hình khối, không làm mờ chéo)
-        self.dw_conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False)
-        
-        # 2. LayerNorm: Chiều chuộng Few-Shot (Miễn nhiễm hoàn toàn với Batch Size = 1)
+        # 1. LayerNorm: Vua ổn định, triệt tiêu nhiễu loạn của Few-Shot (Batch Size = 1)
         self.norm = nn.LayerNorm(channels, eps=1e-6)
         
-        # 3. ECA Conv1D: Chiều chuộng Deepglobe (Đánh trọng số kênh không cần nén)
-        self.eca_pool = nn.AdaptiveAvgPool2d(1)
-        self.eca_conv = nn.Conv1d(1, 1, kernel_size=3, padding=1, bias=False)
-        self.sigmoid = nn.Sigmoid()
+        # 2. Conv1x1 mở rộng kênh gấp đôi (để chuẩn bị cho SimpleGate)
+        self.conv1 = nn.Conv2d(channels, channels * 2, kernel_size=1, bias=False)
+        
+        # 3. Depthwise 3x3: Lấy hình khối cho Lung/ISIC nhưng KHÔNG trộn kênh để bảo vệ Deepglobe
+        self.dw_conv = nn.Conv2d(channels * 2, channels * 2, kernel_size=3, padding=1, groups=channels * 2, bias=False)
+        
+        # 4. Cổng ma thuật NAF (Thay thế hoàn toàn Attention, ReLU, Sigmoid)
+        self.sg = SimpleGate()
+        
+        # 5. Conv1x1: Gom đặc trưng sắc nét trả về
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
 
     def forward(self, x):
         identity = x
         
-        # Bước 1: Trích xuất không gian lân cận
-        out = self.dw_conv(x)
-        
-        # Bước 2: Chuẩn hóa cực kỳ ổn định bằng LayerNorm
-        out = out.permute(0, 2, 3, 1) # Đảo chiều B, C, H, W -> B, H, W, C
+        # Bước 1: Chuẩn hóa LayerNorm (Chuyển kênh về cuối để tính, rồi trả lại)
+        out = x.permute(0, 2, 3, 1)
         out = self.norm(out)
-        out = out.permute(0, 3, 1, 2) # Đảo lại B, C, H, W
+        out = out.permute(0, 3, 1, 2)
         
-        # Bước 3: Trích xuất trọng số Kênh (ECA)
-        v = self.eca_pool(out).squeeze(-1).transpose(-1, -2) # [B, 1, C]
-        v = self.eca_conv(v)
-        v = v.transpose(-1, -2).unsqueeze(-1) # [B, C, 1, 1]
+        # Bước 2: Tích chập mở rộng và thu thập ngữ cảnh 3x3
+        out = self.conv1(out)
+        out = self.dw_conv(out)
         
-        # Bước 4: Trộn trọng số và Cộng Residual giữ độ nét
-        return identity + (out * self.sigmoid(v))
+        # Bước 3: Phép nhân SimpleGate (Tuyệt kỹ phân tách nền/vật thể mà không cần Pooling)
+        out = self.sg(out)
+        
+        # Bước 4: Khôi phục và cộng Residual
+        out = self.conv2(out)
+        
+        return identity + out
 
 
 class ContrastiveFeatureTransformer(nn.Module):
@@ -281,15 +293,15 @@ class ContrastiveFeatureTransformer(nn.Module):
         super(ContrastiveFeatureTransformer, self).__init__()
         out_channels = config_model.out_channels
         
-        # Nén kênh từ ResNet (Giữ nguyên BatchNorm mặc định của ResNet)
+        # Nén kênh từ ResNet
         self.project = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_channels),
+            nn.BatchNorm2d(out_channels), 
             nn.ReLU(inplace=True)
         )
         
-        # Khối LCF: Sự dung hòa tối thượng giữa Không gian, Kênh và Độ ổn định
-        self.lcf_block = LCFAttention(channels=out_channels)
+        # Khối NAFBlock - Đỉnh cao của sự đơn giản và bảo toàn đặc trưng
+        self.naf_block = NAFBlock(channels=out_channels)
         
         # Trộn lại
         self.final_conv = nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False)
@@ -302,13 +314,14 @@ class ContrastiveFeatureTransformer(nn.Module):
             x = F.relu(x)
             
         x = self.project(x)
-        x = self.lcf_block(x)
+        x = self.naf_block(x)
         out = self.final_conv(x)
         
         if self.append_normalize:
             out = F.normalize(out, p=2, dim=1)
             
         return out
+
 
 
     # fits the model for one semantic class, therefore does not work with batches
