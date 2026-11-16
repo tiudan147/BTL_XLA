@@ -216,7 +216,26 @@ def keep_var_loss(original_features, transformed_features):
 #-----------------------------------------------------
 #         Vị trí mạng adapter
 #---------------------------------------------------------
+class ChannelAttention(nn.Module):
+    def __init__(self, channels=64, reduction=4):
+        super(ChannelAttention, self).__init__()
+        # Squeeze: Gom toàn bộ không gian HxW thành 1 con số (Global Average Pooling)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        # Excitation: Học cách đánh giá mức độ quan trọng của 64 kênh
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid() # Đưa trọng số về khoảng [0, 1]
+        )
 
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        # Nhân trọng số trở lại bản đồ đặc trưng gốc
+        return x * y
+        
 class ContrastiveFeatureTransformer(nn.Module):
     # def __init__(self, in_channels, config_model):
     #     super(ContrastiveFeatureTransformer, self).__init__()
@@ -247,28 +266,18 @@ class ContrastiveFeatureTransformer(nn.Module):
         super(ContrastiveFeatureTransformer, self).__init__()
         out_channels = config_model.out_channels  # Mặc định là 64
         
-        # 1. Nhánh nén ban đầu (Dùng chung)
+        # Bước 1: Nén kênh
         self.project = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True)
         )
         
-        # 2. Hai nhánh phân tích song song
-        # - Nhánh A: Chỉ nhìn từng pixel (1x1), giữ chi tiết mảnh, tốt cho Deepglobe
-        self.branch_local = nn.Sequential(
-            nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_channels)
-        )
+        # Bước 2: Khối Chú ý Kênh (Tự động tắt nhiễu, bật đặc trưng lõi)
+        self.se_block = ChannelAttention(channels=out_channels, reduction=4)
         
-        # - Nhánh B: Nhìn lân cận (3x3 Depthwise), tốt cho ISIC, Lung
-        self.branch_spatial = nn.Sequential(
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, groups=out_channels, bias=False),
-            nn.BatchNorm2d(out_channels)
-        )
-        
-        # 3. Kích hoạt chung sau khi cộng
-        self.final_relu = nn.ReLU(inplace=True)
+        # Bước 3: Trộn lại bằng 1x1
+        self.final_conv = nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False)
 
         self.prepend_relu = config_model.prepend_relu
         self.append_normalize = config_model.append_normalize
@@ -277,13 +286,9 @@ class ContrastiveFeatureTransformer(nn.Module):
         if self.prepend_relu:
             x = F.relu(x)
             
-        # Nén kênh chung
-        x_proj = self.project(x)
-        
-        # Đi qua 2 nhánh và cộng gộp (Fusion)
-        out_local = self.branch_local(x_proj)
-        out_spatial = self.branch_spatial(x_proj)
-        out = self.final_relu(out_local + out_spatial)
+        x = self.project(x)
+        x = self.se_block(x)
+        out = self.final_conv(x)
         
         if self.append_normalize:
             out = F.normalize(out, p=2, dim=1)
