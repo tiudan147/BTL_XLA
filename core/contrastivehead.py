@@ -216,65 +216,29 @@ def keep_var_loss(original_features, transformed_features):
 #-----------------------------------------------------
 #         Vị trí mạng adapter
 #---------------------------------------------------------
-class DualContextAffineBlock(nn.Module):
-    """
-    Sự kết hợp giữa SE-Net (Thử nghiệm 3) và GC-Net (Thử nghiệm 9):
-    1. Dual Squeeze: Kết hợp GAP (bảo vệ Deepglobe) + Softmax Context Attention (bắt khối lớn cho Lung/ISIC).
-    2. Shared LayerNorm Bottleneck: Chuẩn hóa ổn định cho bài toán 1-shot (Batch Size nhỏ).
-    3. Affine Modulation (FiLM): Vừa nhân trọng số kênh (SE Scale) vừa cộng ngữ cảnh toàn cục (GC Shift).
-    """
-    def __init__(self, channels=64, reduction=4):
-        super(DualContextAffineBlock, self).__init__()
-        mid_channels = max(8, channels // reduction)
-
-        # 1. Context Modeling: Nhánh GAP (SE) + Nhánh Self-Attention 1x1 (GC-Net)
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.context_conv = nn.Conv2d(channels, 1, kernel_size=1, bias=False)
-
-        # 2. Shared Bottleneck với LayerNorm (giúp hội tụ cực nhanh trong 25 epochs SGD)
-        self.bottleneck = nn.Sequential(
-            nn.Conv2d(channels, mid_channels, kernel_size=1, bias=False),
-            nn.LayerNorm([mid_channels, 1, 1]),
-            nn.ReLU(inplace=True)
-        )
-
-        # 3a. Nhánh Scale (Multiplicative Gating giống SE -> Tắt kênh nhiễu cho ISIC & Deepglobe)
-        self.fc_scale = nn.Sequential(
-            nn.Conv2d(mid_channels, channels, kernel_size=1, bias=False),
-            nn.Sigmoid()
-        )
-
-        # 3b. Nhánh Shift (Additive Fusion giống GC-Net -> Bơm ngữ cảnh toàn cục cho Lung)
-        self.fc_shift = nn.Conv2d(mid_channels, channels, kernel_size=1, bias=False)
-
-        # Khởi tạo nhánh shift bằng 0 để ban đầu mô hình ổn định tuyệt đối như SE,
-        # sau đó mới học dần lượng ngữ cảnh cộng thêm qua 25 epochs
-        nn.init.zeros_(self.fc_shift.weight)
+class LargeKernelAttention(nn.Module):
+    def __init__(self, channels=64):
+        super(LargeKernelAttention, self).__init__()
+        
+        # 1. Nhìn cục bộ: Depthwise Conv 5x5 (Giữ nét đường biên)
+        self.spatial_local = nn.Conv2d(channels, channels, kernel_size=5, padding=2, groups=channels, bias=False)
+        
+        # 2. Nhìn bao quát: Depthwise Dilated Conv 5x5, độ giãn 3 (Mở rộng tầm nhìn lên 17x17)
+        self.spatial_global = nn.Conv2d(channels, channels, kernel_size=5, padding=6, groups=channels, dilation=3, bias=False)
+        
+        # 3. Gom kênh: Conv 1x1
+        self.pw_conv = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+        
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        b, c, h, w = x.size()
-
-        # --- BƯỚC 1: Gom ngữ cảnh kép (Dual Squeeze) ---
-        # Nhánh 1: Trung bình toàn cục (SE) -> [B, C, 1, 1]
-        gap_context = self.avg_pool(x)
-
-        # Nhánh 2: Chú ý toàn cục (GC-Net) -> [B, C, 1, 1]
-        attn_mask = self.context_conv(x).view(b, 1, h * w)
-        attn_mask = F.softmax(attn_mask, dim=-1) # [B, 1, H*W]
-        x_flat = x.view(b, c, h * w)             # [B, C, H*W]
-        attn_context = torch.bmm(x_flat, attn_mask.transpose(1, 2)).unsqueeze(-1) # [B, C, 1, 1]
-
-        # Hợp nhất 2 nguồn ngữ cảnh
-        global_context = 0.5 * (gap_context + attn_context)
-
-        # --- BƯỚC 2: Nén đặc trưng qua Bottleneck có LayerNorm ---
-        hidden = self.bottleneck(global_context)
-
-        # --- BƯỚC 3: Điều biến Affine (Scale & Shift) ---
-        scale = self.fc_scale(hidden) # Trọng số lọc kênh [0, 1]
-        shift = self.fc_shift(hidden) # Ngữ cảnh cộng thêm
-
-        return x * scale + shift
+        # Dùng dữ liệu nhào nặn ra mặt nạ Attention
+        attn = self.spatial_local(x)
+        attn = self.spatial_global(attn)
+        attn = self.pw_conv(attn)
+        
+        # Nhân mặt nạ vào đặc trưng gốc
+        return x * self.sigmoid(attn)
 
 class ContrastiveFeatureTransformer(nn.Module):
     # def __init__(self, in_channels, config_model):
@@ -301,21 +265,22 @@ class ContrastiveFeatureTransformer(nn.Module):
     #         x = F.normalize(x, p=2, dim=1)
     #     return x
 
+    class ContrastiveFeatureTransformer(nn.Module):
     def __init__(self, in_channels, config_model):
         super(ContrastiveFeatureTransformer, self).__init__()
-        out_channels = config_model.out_channels # Mặc định là 64
-
-        # Bước 1: Nén kênh bằng 1x1 Conv (Tuyệt đối không dùng 3x3 để bảo vệ Deepglobe)
+        out_channels = config_model.out_channels
+        
+        # Bước 1: Nén kênh
         self.project = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True)
         )
-
-        # Bước 2: Khối Dual-Context Affine (Hợp nhất SE + GC-Net)
-        self.adapter_attention = DualContextAffineBlock(channels=out_channels, reduction=4)
-
-        # Bước 3: Trộn kênh đầu ra bằng 1x1 Conv
+        
+        # Bước 2: Khối Chú ý Nhân chập Lớn (LKA - Tầm nhìn 17x17, chạy siêu nhanh)
+        self.lka_block = LargeKernelAttention(channels=out_channels)
+        
+        # Bước 3: Trộn lại
         self.final_conv = nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False)
 
         self.prepend_relu = config_model.prepend_relu
@@ -324,14 +289,14 @@ class ContrastiveFeatureTransformer(nn.Module):
     def forward(self, x):
         if self.prepend_relu:
             x = F.relu(x)
-
+            
         x = self.project(x)
-        x = self.adapter_attention(x)
+        x = self.lka_block(x)
         out = self.final_conv(x)
-
+        
         if self.append_normalize:
             out = F.normalize(out, p=2, dim=1)
-
+            
         return out
 
     # fits the model for one semantic class, therefore does not work with batches
