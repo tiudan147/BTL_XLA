@@ -216,34 +216,32 @@ def keep_var_loss(original_features, transformed_features):
 #-----------------------------------------------------
 #         Vị trí mạng adapter
 #---------------------------------------------------------
-class DynamicSpatialGate(nn.Module):
-    def __init__(self, channels=64):
-        super(DynamicSpatialGate, self).__init__()
-        
-        # 1. Trích xuất thông tin lân cận (3x3 Depthwise - Siêu nhẹ)
-        self.spatial_context = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True)
-        )
-        
-        # 2. Cổng kiểm duyệt thông minh (Sinh mặt nạ 0 đến 1)
-        self.gate = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.Sigmoid()
-        )
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class NAM_ChannelAttention(nn.Module):
+    def __init__(self, channels):
+        super(NAM_ChannelAttention, self).__init__()
+        # Tạo một lớp BatchNorm2d riêng để lấy trọng số Gamma (Scale)
+        self.bn = nn.BatchNorm2d(channels)
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        # Tính toán lớp thông tin lân cận
-        context = self.spatial_context(x)
+        # 1. Chuẩn hóa đặc trưng
+        out = self.bn(x)
         
-        # Tính toán Cổng kiểm duyệt dựa trên đặc trưng gốc
-        gate_mask = self.gate(x)
+        # 2. Lấy trọng số Gamma (Scale) từ BatchNorm
+        # shape của bn.weight là [C]. Ta view nó thành [1, C, 1, 1] để nhân broadcasting
+        weight = self.bn.weight.view(1, -1, 1, 1)
         
-        # Trộn thông minh: Giữ nguyên gốc + Chỉ lấy thông tin lân cận ở những nơi Cổng cho phép
-        return x + (context * gate_mask)
-
+        # 3. Tính tỷ lệ trọng số Gamma so với tổng các Gamma
+        # Kênh nào có độ biến thiên cao sẽ được nhận hệ số lớn hơn
+        normalized_weight = weight / (torch.sum(torch.abs(weight)) + 1e-5)
+        
+        # 4. Nhân trọng số trở lại bản đồ đặc trưng (Attention)
+        out = x * self.sigmoid(normalized_weight)
+        return out
 class ContrastiveFeatureTransformer(nn.Module):
     # def __init__(self, in_channels, config_model):
     #     super(ContrastiveFeatureTransformer, self).__init__()
@@ -273,15 +271,13 @@ class ContrastiveFeatureTransformer(nn.Module):
         super(ContrastiveFeatureTransformer, self).__init__()
         out_channels = config_model.out_channels
         
-        # Bước 1: Nén kênh
-        self.project = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
-        )
+        # Bước 1: Nén kênh bằng Conv1x1
+        self.project_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
         
-        # Bước 2: Khối DSG - Tự học cách phân tích không gian, chạy cực nhanh
-        self.dsg_block = DynamicSpatialGate(channels=out_channels)
+        # Bước 2: Tích hợp NAM Attention ngay sau Conv1x1 (Nó kiêm luôn vai trò của BatchNorm)
+        self.nam_block = NAM_ChannelAttention(channels=out_channels)
+        
+        self.relu = nn.ReLU(inplace=True)
         
         # Bước 3: Trộn lại
         self.final_conv = nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False)
@@ -293,8 +289,10 @@ class ContrastiveFeatureTransformer(nn.Module):
         if self.prepend_relu:
             x = F.relu(x)
             
-        x = self.project(x)
-        x = self.dsg_block(x)
+        x = self.project_conv(x)
+        x = self.nam_block(x)
+        x = self.relu(x)
+        
         out = self.final_conv(x)
         
         if self.append_normalize:
