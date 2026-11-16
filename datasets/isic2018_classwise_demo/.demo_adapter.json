@@ -1,0 +1,11 @@
+{
+  "source": "/home/nhanlx05/projects/BTL_XLA/datasets/isic2018_raw",
+  "n_ids": 18,
+  "counts": {
+    "1": 6,
+    "2": 6,
+    "3": 6
+  },
+  "seed": 1234,
+  "note": "Pseudo-classes built by demo notebook (index % 3)."
+}
