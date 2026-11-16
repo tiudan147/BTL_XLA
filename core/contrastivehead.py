@@ -216,44 +216,33 @@ def keep_var_loss(original_features, transformed_features):
 #-----------------------------------------------------
 #         Vị trí mạng adapter
 #---------------------------------------------------------
-class cSE_Block(nn.Module):
-    # Nhánh 1: Chú ý Kênh (Channel Squeeze & Excitation)
-    def __init__(self, channels, reduction=4):
-        super(cSE_Block, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Sequential(
-            nn.Conv2d(channels, channels // reduction, kernel_size=1, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels // reduction, channels, kernel_size=1, bias=False),
+class DynamicSpatialGate(nn.Module):
+    def __init__(self, channels=64):
+        super(DynamicSpatialGate, self).__init__()
+        
+        # 1. Trích xuất thông tin lân cận (3x3 Depthwise - Siêu nhẹ)
+        self.spatial_context = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        # 2. Cổng kiểm duyệt thông minh (Sinh mặt nạ 0 đến 1)
+        self.gate = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
             nn.Sigmoid()
         )
 
     def forward(self, x):
-        # Nhân trọng số kênh vào đặc trưng
-        return x * self.fc(self.avg_pool(x))
-
-class sSE_Block(nn.Module):
-    # Nhánh 2: Chú ý Không gian (Spatial Squeeze & Excitation - KHÔNG POOLING)
-    def __init__(self, channels):
-        super(sSE_Block, self).__init__()
-        # Dùng Conv1x1 ép C kênh thành 1 mặt nạ, giữ nguyên HxW
-        self.conv = nn.Conv2d(channels, 1, kernel_size=1, bias=False)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        # Nhân trọng số không gian vào đặc trưng
-        return x * self.sigmoid(self.conv(x))
-
-class scSE_Block(nn.Module):
-    # Trộn song song 2 nhánh
-    def __init__(self, channels, reduction=4):
-        super(scSE_Block, self).__init__()
-        self.cSE = cSE_Block(channels, reduction)
-        self.sSE = sSE_Block(channels)
-
-    def forward(self, x):
-        # Cộng trực tiếp kết quả của 2 nhánh
-        return self.cSE(x) + self.sSE(x)
+        # Tính toán lớp thông tin lân cận
+        context = self.spatial_context(x)
+        
+        # Tính toán Cổng kiểm duyệt dựa trên đặc trưng gốc
+        gate_mask = self.gate(x)
+        
+        # Trộn thông minh: Giữ nguyên gốc + Chỉ lấy thông tin lân cận ở những nơi Cổng cho phép
+        return x + (context * gate_mask)
 
 class ContrastiveFeatureTransformer(nn.Module):
     # def __init__(self, in_channels, config_model):
@@ -284,17 +273,17 @@ class ContrastiveFeatureTransformer(nn.Module):
         super(ContrastiveFeatureTransformer, self).__init__()
         out_channels = config_model.out_channels
         
-        # Nén kênh
+        # Bước 1: Nén kênh
         self.project = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True)
         )
         
-        # Khối scSE (Song song Kênh & Không gian, bảo toàn cấu trúc điểm ảnh)
-        self.scse_block = scSE_Block(channels=out_channels, reduction=4)
+        # Bước 2: Khối DSG - Tự học cách phân tích không gian, chạy cực nhanh
+        self.dsg_block = DynamicSpatialGate(channels=out_channels)
         
-        # Trộn lại
+        # Bước 3: Trộn lại
         self.final_conv = nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False)
 
         self.prepend_relu = config_model.prepend_relu
@@ -305,7 +294,7 @@ class ContrastiveFeatureTransformer(nn.Module):
             x = F.relu(x)
             
         x = self.project(x)
-        x = self.scse_block(x)
+        x = self.dsg_block(x)
         out = self.final_conv(x)
         
         if self.append_normalize:
