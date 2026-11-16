@@ -216,26 +216,32 @@ def keep_var_loss(original_features, transformed_features):
 #-----------------------------------------------------
 #         Vị trí mạng adapter
 #---------------------------------------------------------
-class ChannelAttention(nn.Module):
-    def __init__(self, channels=64, reduction=4):
-        super(ChannelAttention, self).__init__()
-        # Squeeze: Gom toàn bộ không gian HxW thành 1 con số (Global Average Pooling)
+class ECA_Layer(nn.Module):
+    def __init__(self, k_size=3):
+        super(ECA_Layer, self).__init__()
+        # Squeeze: Gom không gian HxW thành 1x1
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        # Excitation: Học cách đánh giá mức độ quan trọng của 64 kênh
-        self.fc = nn.Sequential(
-            nn.Linear(channels, channels // reduction, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(channels // reduction, channels, bias=False),
-            nn.Sigmoid() # Đưa trọng số về khoảng [0, 1]
-        )
+        # Excitation: Dùng Conv1D để học tương quan chéo giữa các kênh mà KHÔNG giảm số kênh
+        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        b, c, _, _ = x.size()
-        y = self.avg_pool(x).view(b, c)
-        y = self.fc(y).view(b, c, 1, 1)
-        # Nhân trọng số trở lại bản đồ đặc trưng gốc
-        return x * y
+        # x shape: [Batch, Channels, H, W]
+        b, c, h, w = x.size()
+        y = self.avg_pool(x) # [B, C, 1, 1]
         
+        # Đổi chiều để đưa vào Conv1D: [B, 1, C]
+        y = y.squeeze(-1).transpose(-1, -2) 
+        
+        # Tích chập 1 chiều đánh trọng số
+        y = self.conv(y) 
+        
+        # Trả lại chiều gốc: [B, C, 1, 1]
+        y = y.transpose(-1, -2).unsqueeze(-1) 
+        
+        # Nhân trọng số trở lại
+        return x * self.sigmoid(y)
+
 class ContrastiveFeatureTransformer(nn.Module):
     # def __init__(self, in_channels, config_model):
     #     super(ContrastiveFeatureTransformer, self).__init__()
@@ -266,15 +272,15 @@ class ContrastiveFeatureTransformer(nn.Module):
         super(ContrastiveFeatureTransformer, self).__init__()
         out_channels = config_model.out_channels  # Mặc định là 64
         
-        # Bước 1: Nén kênh
+        # Bước 1: Nén kênh gốc
         self.project = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True)
         )
         
-        # Bước 2: Khối Chú ý Kênh (Tự động tắt nhiễu, bật đặc trưng lõi)
-        self.se_block = ChannelAttention(channels=out_channels, reduction=4)
+        # Bước 2: Khối Chú ý kênh hiệu quả cao (ECA)
+        self.eca_block = ECA_Layer(k_size=3)
         
         # Bước 3: Trộn lại bằng 1x1
         self.final_conv = nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False)
@@ -287,7 +293,7 @@ class ContrastiveFeatureTransformer(nn.Module):
             x = F.relu(x)
             
         x = self.project(x)
-        x = self.se_block(x)
+        x = self.eca_block(x)
         out = self.final_conv(x)
         
         if self.append_normalize:
