@@ -265,7 +265,6 @@ class ContrastiveFeatureTransformer(nn.Module):
     #         x = F.normalize(x, p=2, dim=1)
     #     return x
 
-    class ContrastiveFeatureTransformer(nn.Module):
     def __init__(self, in_channels, config_model):
         super(ContrastiveFeatureTransformer, self).__init__()
         out_channels = config_model.out_channels
