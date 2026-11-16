@@ -6,7 +6,8 @@ from torchvision import transforms
 from PIL import Image, ImageDraw
 import torch.nn.functional as F
 
-norm = lambda t: (t - t.min()) / (t.max() - t.min())
+# norm = lambda t: (t - t.min()) / (t.max() - t.min())
+norm = lambda t: (t - t.min()) / (t.max() - t.min() + 1e-8) # fix lỗi RuntimeWarning: invalid value encountered in divide
 denorm = lambda t, min_, max_: t * (max_ - min_) + min_
 
 percentilerange = lambda t, perc: t.min() + perc * (t.max() - t.min())
