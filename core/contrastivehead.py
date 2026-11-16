@@ -158,32 +158,6 @@ def self_attention_loss(f_base, f_transformed, mask_base, mask_transformed, k, a
     return loss.mean()
 
 #------------------------------------------------
-#            Thêm dice_loss
-#------------------------------------------------
-
-def dice_loss(pred, target, smooth=1e-5):
-    # Ép phẳng tensor để tính toán nhanh trên GPU
-    pred_flat = pred.contiguous().view(-1)
-    target_flat = target.contiguous().view(-1)
-    
-    # Tính phần giao nhau (Intersection)
-    intersection = (pred_flat * target_flat).sum()
-    dice_score = (2. * intersection + smooth) / (pred_flat.sum() + target_flat.sum() + smooth)
-    return 1. - dice_score
-def compute_support_dice_loss(f_base, f_transformed, augmented_smasks, k, aug):
-    c, h, w = f_base.shape[-3:]
-    pseudoquery = torch.cat(f_base.view(k, aug, c, h, w).unbind(0), -1)
-    pseudoquerymask = torch.cat(augmented_smasks.view(k, aug, h, w).unbind(0), -1)
-    pseudosupport = f_transformed.view(k, aug, c, h, w).transpose(0, 1)
-    pseudosupportmask = augmented_smasks.view(k, aug, h, w).transpose(0, 1)
-    
-    # Dự đoán mask qua Dense Affinity giữa support gốc và support biến dạng
-    pred_map = calc_q_pred_coarse_nodetach(pseudoquery, pseudosupport, pseudosupportmask, l0=0)
-    
-    # Tính Dice Loss với nhãn ground truth của support
-    return dice_loss(pred_map.float(), pseudoquerymask.float())
-
-#------------------------------------------------
 #            Nơi định nghĩa hàm loss Lp
 #------------------------------------------------
 
@@ -498,8 +472,7 @@ class ContrastiveFeatureTransformer(nn.Module):
             # Aggregate loss
             # loss = qloss + sloss + q_s_loss_diff + proto_loss
 
-            loss_dice = compute_support_dice_loss(original_features, transformed_features, augmented_smasks, k, aug)
-            loss = loss = qloss + sloss + q_s_loss_diff + (1.5 * proto_loss) + (0.5 * loss_dice) # tăng trọng số lp và thêm loss dice
+            loss = loss = qloss + sloss + q_s_loss_diff + (1.5 * proto_loss) # tăng trọng số lp
             assert loss.isfinite().all(), f"invalid contrastive loss:{loss}"
 
             # Backpropagation and optimization
