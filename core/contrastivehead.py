@@ -216,29 +216,44 @@ def keep_var_loss(original_features, transformed_features):
 #-----------------------------------------------------
 #         Vị trí mạng adapter
 #---------------------------------------------------------
-class LargeKernelAttention(nn.Module):
-    def __init__(self, channels=64):
-        super(LargeKernelAttention, self).__init__()
-        
-        # 1. Nhìn cục bộ: Depthwise Conv 5x5 (Giữ nét đường biên)
-        self.spatial_local = nn.Conv2d(channels, channels, kernel_size=5, padding=2, groups=channels, bias=False)
-        
-        # 2. Nhìn bao quát: Depthwise Dilated Conv 5x5, độ giãn 3 (Mở rộng tầm nhìn lên 17x17)
-        self.spatial_global = nn.Conv2d(channels, channels, kernel_size=5, padding=6, groups=channels, dilation=3, bias=False)
-        
-        # 3. Gom kênh: Conv 1x1
-        self.pw_conv = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        
+class cSE_Block(nn.Module):
+    # Nhánh 1: Chú ý Kênh (Channel Squeeze & Excitation)
+    def __init__(self, channels, reduction=4):
+        super(cSE_Block, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(channels, channels // reduction, kernel_size=1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // reduction, channels, kernel_size=1, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        # Nhân trọng số kênh vào đặc trưng
+        return x * self.fc(self.avg_pool(x))
+
+class sSE_Block(nn.Module):
+    # Nhánh 2: Chú ý Không gian (Spatial Squeeze & Excitation - KHÔNG POOLING)
+    def __init__(self, channels):
+        super(sSE_Block, self).__init__()
+        # Dùng Conv1x1 ép C kênh thành 1 mặt nạ, giữ nguyên HxW
+        self.conv = nn.Conv2d(channels, 1, kernel_size=1, bias=False)
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        # Dùng dữ liệu nhào nặn ra mặt nạ Attention
-        attn = self.spatial_local(x)
-        attn = self.spatial_global(attn)
-        attn = self.pw_conv(attn)
-        
-        # Nhân mặt nạ vào đặc trưng gốc
-        return x * self.sigmoid(attn)
+        # Nhân trọng số không gian vào đặc trưng
+        return x * self.sigmoid(self.conv(x))
+
+class scSE_Block(nn.Module):
+    # Trộn song song 2 nhánh
+    def __init__(self, channels, reduction=4):
+        super(scSE_Block, self).__init__()
+        self.cSE = cSE_Block(channels, reduction)
+        self.sSE = sSE_Block(channels)
+
+    def forward(self, x):
+        # Cộng trực tiếp kết quả của 2 nhánh
+        return self.cSE(x) + self.sSE(x)
 
 class ContrastiveFeatureTransformer(nn.Module):
     # def __init__(self, in_channels, config_model):
@@ -269,17 +284,17 @@ class ContrastiveFeatureTransformer(nn.Module):
         super(ContrastiveFeatureTransformer, self).__init__()
         out_channels = config_model.out_channels
         
-        # Bước 1: Nén kênh
+        # Nén kênh
         self.project = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True)
         )
         
-        # Bước 2: Khối Chú ý Nhân chập Lớn (LKA - Tầm nhìn 17x17, chạy siêu nhanh)
-        self.lka_block = LargeKernelAttention(channels=out_channels)
+        # Khối scSE (Song song Kênh & Không gian, bảo toàn cấu trúc điểm ảnh)
+        self.scse_block = scSE_Block(channels=out_channels, reduction=4)
         
-        # Bước 3: Trộn lại
+        # Trộn lại
         self.final_conv = nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False)
 
         self.prepend_relu = config_model.prepend_relu
@@ -290,7 +305,7 @@ class ContrastiveFeatureTransformer(nn.Module):
             x = F.relu(x)
             
         x = self.project(x)
-        x = self.lka_block(x)
+        x = self.scse_block(x)
         out = self.final_conv(x)
         
         if self.append_normalize:
