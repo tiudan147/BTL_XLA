@@ -167,7 +167,7 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     assert b == k * aug, 'provide correct k and aug such that dim0=k*aug'
 
     # ==========================================
-    # 1. GLOBAL LEVEL
+    # 1. GLOBAL PROTOTYPE INFONCE (Neo giữ ngữ nghĩa vĩ mô)
     # ==========================================
     fg_proto_o, bg_proto_o = augwise_proto(base, mask_base, k, aug)
     fg_proto_t, bg_proto_t = augwise_proto(transformed, mask_transformed, k, aug)
@@ -177,37 +177,41 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     neg_bg_t = 0.5 * (torch.exp(ssim(fg_proto_t, bg_proto_o) / tau_p) + torch.exp(ssim(fg_proto_t, bg_proto_t) / tau_p))
     loss_global_fg = 0.5 * (-torch.log(pos_fg / (pos_fg + neg_bg_o)) - torch.log(pos_fg / (pos_fg + neg_bg_t))).mean()
 
-    pos_bg = torch.exp(ssim(bg_proto_o, bg_proto_t) / tau_p)
-    neg_bg_cross = 0.5 * (torch.exp(ssim(bg_proto_o, fg_proto_t) / tau_p) + torch.exp(ssim(bg_proto_t, fg_proto_o) / tau_p))
-    loss_global_bg = -torch.log(pos_bg / (pos_bg + neg_bg_cross)).mean()
+    # ==========================================
+    # 2. ĐỘT PHÁ V19: SELF-ATTENTION DICE LOSS (SADL)
+    # Mô phỏng chính xác thuật toán suy luận Test-time
+    # ==========================================
+    
+    # Chuẩn hóa đặc trưng
+    base_norm = F.normalize(base, p=2, dim=1)        # Đóng vai trò Support (Key)
+    trans_norm = F.normalize(transformed, p=2, dim=1) # Đóng vai trò Query (Query)
+    
+    # Ép phẳng không gian (Flatten)
+    Q = trans_norm.view(b, c, -1).transpose(1, 2) # [b, h*w, c]
+    K = base_norm.view(b, c, -1)                  # [b, c, h*w]
+    
+    # Ma trận tương quan Cross-Attention
+    # Chia cho căn bậc 2 của C để chống bùng nổ phân phối (chuẩn Transformer)
+    affinity = torch.bmm(Q, K) / (c ** 0.5)       # [b, h*w, h*w]
+    attn_weights = F.softmax(affinity, dim=-1)    # [b, h*w, h*w]
+    
+    # Downsample mặt nạ (Labels)
+    m_s = segutils.downsample_mask(mask_base, h, w).view(b, h*w, 1).float()       # Value (V)
+    m_q_gt = segutils.downsample_mask(mask_transformed, h, w).view(b, h*w).float() # Ground Truth Query
+    
+    # Dự đoán mặt nạ (Pseudo-Query Mask Prediction)
+    q_pred = torch.bmm(attn_weights, m_s).squeeze(-1) # [b, h*w]
+    
+    # Tính DICE LOSS (Tối ưu trực tiếp IoU, miễn nhiễm với nhãn nhiễu)
+    intersection = (q_pred * m_q_gt).sum(dim=1)
+    union = q_pred.sum(dim=1) + m_q_gt.sum(dim=1)
+    
+    # Thêm 1e-6 để tránh lỗi chia cho 0
+    dice_score = (2.0 * intersection + 1e-6) / (union + 1e-6)
+    loss_dice = (1.0 - dice_score).mean()
 
-    mask_4d = segutils.downsample_mask(mask_base, h, w).unsqueeze(1).float()
-    base_norm = F.normalize(base, p=2, dim=1)
-    trans_norm = F.normalize(transformed, p=2, dim=1)
-
-    loss_grid = 0.0
-
-    if h >= 20 and w >= 20:
-        # ==========================================
-        # 2. REGIONAL LEVEL (Grid 3x3) - "Xương sống" của Deepglobe
-        # ==========================================
-        grid_size = 3
-        grid_area = F.adaptive_avg_pool2d(mask_4d, (grid_size, grid_size))
-        valid_grid = (grid_area > 0.4).float().squeeze(1).view(b, grid_size * grid_size)
-        
-        local_fg_o = F.normalize(F.adaptive_avg_pool2d(base * mask_4d, (grid_size, grid_size)) / (grid_area + 1e-6), p=2, dim=1).view(b, c, -1)
-        local_fg_t = F.normalize(F.adaptive_avg_pool2d(transformed * mask_4d, (grid_size, grid_size)) / (grid_area + 1e-6), p=2, dim=1).view(b, c, -1)
-        
-        grid_sim = (local_fg_o * local_fg_t).sum(dim=1)
-        loss_grid_pos = ((1.0 - grid_sim) * valid_grid).sum() / (valid_grid.sum() + 1e-6)
-        
-        bg_o_unsq_grid = F.normalize(bg_proto_o, p=2, dim=-1).unsqueeze(-1)
-        bg_t_unsq_grid = F.normalize(bg_proto_t, p=2, dim=-1).unsqueeze(-1)
-        neg_l2g_o = F.relu((local_fg_o * bg_t_unsq_grid).sum(dim=1) - 0.20)
-        neg_l2g_t = F.relu((local_fg_t * bg_o_unsq_grid).sum(dim=1) - 0.20)
-        loss_grid_neg = ((neg_l2g_o + neg_l2g_t) * valid_grid).sum() / (valid_grid.sum() + 1e-6)
-        
-        loss_grid = loss_grid_pos + 0.5 * loss_grid_neg
+    # Tỷ lệ tổng hợp: 1.0 (Global FG) + 0.5 (Self-Attention Dice)
+    return loss_global_fg + 0.5 * loss_dice
 
     # ==========================================
     # 3. LOCAL LEVEL (Dense InfoNCE) - "Lưỡi cưa" của Lung/ISIC/SUIM
