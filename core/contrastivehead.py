@@ -424,6 +424,9 @@ class ContrastiveFeatureTransformer(nn.Module):
         self.prepend_relu = config_model.prepend_relu
         self.append_normalize = config_model.append_normalize
 
+        # -----------------------------------Xóa đây-----------------------------------
+        self.enhanced_loss_fn = EnhancedAdaptationLoss(margin=0.15, lambda_ortho=0.5, lambda_bg=0.5)
+
     def forward(self, x):
         if self.prepend_relu:
             x = F.relu(x)
