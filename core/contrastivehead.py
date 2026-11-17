@@ -167,14 +167,12 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     assert b == k * aug, 'provide correct k and aug such that dim0=k*aug'
 
     # ==========================================
-    # 1. TÍNH TOÁN PROTOTYPE TOÀN CỤC (Anchor tĩnh)
+    # 1. TÍNH TOÁN PROTOTYPE TOÀN CỤC (Anchor)
     # ==========================================
     fg_proto_o, bg_proto_o = augwise_proto(base, mask_base, k, aug)
     fg_proto_t, bg_proto_t = augwise_proto(transformed, mask_transformed, k, aug)
 
-    # ==========================================
-    # 2. GLOBAL LOSS (Duy trì cấu trúc vĩ mô)
-    # ==========================================
+    # 2. GLOBAL INFONCE (Duy trì bức tranh tổng thể)
     pos_fg = torch.exp(ssim(fg_proto_o, fg_proto_t) / tau_p)
     neg_bg_o = 0.5 * (torch.exp(ssim(fg_proto_o, bg_proto_t) / tau_p) + torch.exp(ssim(fg_proto_o, bg_proto_o) / tau_p))
     neg_bg_t = 0.5 * (torch.exp(ssim(fg_proto_t, bg_proto_o) / tau_p) + torch.exp(ssim(fg_proto_t, bg_proto_t) / tau_p))
@@ -185,17 +183,18 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     loss_global_bg = -torch.log(pos_bg / (pos_bg + neg_bg_cross)).mean()
 
     # ==========================================
-    # 3. SEMANTIC-GATED PIXEL-TO-PROTOTYPE (Lưỡi kiếm tinh gọn)
+    # 3. ROBUST GENERALIZED PIXEL-TO-PROTOTYPE (RG-P2P)
+    # Tự động chống rác nhãn mà không làm mất đạo hàm ranh giới
     # ==========================================
     tau_dense = 0.2
-    tau_gate = 0.1  # Độ nhạy của Cổng Ngữ nghĩa
     m_pos = 0.15 
     m_neg = 0.05 
+    q_param = 0.5  # Siêu tham số GCE (Cân bằng giữa Robustness và Cập nhật Biên)
     
     base_norm = F.normalize(base, p=2, dim=1)
     trans_norm = F.normalize(transformed, p=2, dim=1)
 
-    # Mỏ neo tĩnh
+    # Mỏ neo tĩnh (Không cho gradient đi qua để làm mục tiêu chuẩn)
     fg_p_o = F.normalize(fg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
     bg_p_o = F.normalize(bg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
     fg_p_t = F.normalize(fg_proto_t, p=2, dim=-1).view(b, c, 1, 1).detach()
@@ -203,58 +202,38 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
 
     soft_mask_o = segutils.downsample_mask(mask_base, h, w).unsqueeze(1)
     soft_mask_t = segutils.downsample_mask(mask_transformed, h, w).unsqueeze(1)
-    
-    # --- SEMANTIC GATE: Dùng Trí thông minh của mô hình để lọc rác ---
-    # Ảnh gốc (O)
-    sim_fg_o_raw = (base_norm * fg_p_t).sum(dim=1, keepdim=True)
-    sim_bg_o_raw = (base_norm * bg_p_t).sum(dim=1, keepdim=True)
-    gate_fg_o = torch.sigmoid((sim_fg_o_raw - sim_bg_o_raw) / tau_gate).detach()
-    gate_bg_o = torch.sigmoid((sim_bg_o_raw - sim_fg_o_raw) / tau_gate).detach()
-    
-    # Ảnh biến đổi (T)
-    sim_fg_t_raw = (trans_norm * fg_p_o).sum(dim=1, keepdim=True)
-    sim_bg_t_raw = (trans_norm * bg_p_o).sum(dim=1, keepdim=True)
-    gate_fg_t = torch.sigmoid((sim_fg_t_raw - sim_bg_t_raw) / tau_gate).detach()
-    gate_bg_t = torch.sigmoid((sim_bg_t_raw - sim_fg_t_raw) / tau_gate).detach()
-
-    # Áp dụng cổng thông minh vào Mask
-    eff_mask_fg_o = soft_mask_o * gate_fg_o
-    eff_mask_fg_t = soft_mask_t * gate_fg_t
-    
     bg_mask_o = torch.clamp(1.0 - soft_mask_o, min=0.0, max=1.0)
     bg_mask_t = torch.clamp(1.0 - soft_mask_t, min=0.0, max=1.0)
-    eff_mask_bg_o = bg_mask_o * gate_bg_o
-    eff_mask_bg_t = bg_mask_t * gate_bg_t
 
-    # --- A. CĂN CHỈNH TỪNG PIXEL TIỀN CẢNH (Với Margin CosFace) ---
-    pos_fg_o = (sim_fg_o_raw - m_pos) / tau_dense
-    neg_fg_o_1 = (sim_bg_o_raw + m_neg) / tau_dense
-    neg_fg_o_2 = ((base_norm * bg_p_o).sum(dim=1, keepdim=True) + m_neg) / tau_dense
-    loss_fg_map_o = torch.logsumexp(torch.stack([pos_fg_o, neg_fg_o_1, neg_fg_o_2], dim=-1), dim=-1) - pos_fg_o
+    # --- HÀM TÍNH LOSS GCE DÀY ĐẶC (Dense Robust GCE) ---
+    def robust_gce_loss(pixel_feats, pos_anchor, neg_anchor1, neg_anchor2, mask):
+        # Tính khoảng cách Cosine có Margin
+        sim_pos = ((pixel_feats * pos_anchor).sum(dim=1, keepdim=True) - m_pos) / tau_dense
+        sim_neg1 = ((pixel_feats * neg_anchor1).sum(dim=1, keepdim=True) + m_neg) / tau_dense
+        sim_neg2 = ((pixel_feats * neg_anchor2).sum(dim=1, keepdim=True) + m_neg) / tau_dense
 
-    pos_fg_t = (sim_fg_t_raw - m_pos) / tau_dense
-    neg_fg_t_1 = (sim_bg_t_raw + m_neg) / tau_dense
-    neg_fg_t_2 = ((trans_norm * bg_p_t).sum(dim=1, keepdim=True) + m_neg) / tau_dense
-    loss_fg_map_t = torch.logsumexp(torch.stack([pos_fg_t, neg_fg_t_1, neg_fg_t_2], dim=-1), dim=-1) - pos_fg_t
+        # Tính xác suất Pixel thuộc về Positive Anchor (Softmax)
+        logits = torch.stack([sim_pos, sim_neg1, sim_neg2], dim=-1)
+        probs = F.softmax(logits, dim=-1)
+        p_pos = probs[..., 0] # Xác suất mục tiêu
 
-    loss_dense_fg = 0.5 * ((loss_fg_map_o * eff_mask_fg_o).sum() / (eff_mask_fg_o.sum() + 1e-6) +
-                           (loss_fg_map_t * eff_mask_fg_t).sum() / (eff_mask_fg_t.sum() + 1e-6))
+        # Áp dụng công thức Generalized Cross Entropy: (1 - p^q) / q
+        # Nếu q = 0.5, hàm trở thành 2 * (1 - sqrt(p)). Không bao giờ bùng nổ ra vô cực.
+        gce_loss_map = (1.0 - torch.pow(p_pos + 1e-6, q_param)) / q_param
+        
+        return (gce_loss_map * mask).sum() / (mask.sum() + 1e-6)
+
+    # --- A. CĂN CHỈNH TỪNG PIXEL TIỀN CẢNH ---
+    loss_fg_o = robust_gce_loss(base_norm, fg_p_t, bg_p_t, bg_p_o, soft_mask_o)
+    loss_fg_t = robust_gce_loss(trans_norm, fg_p_o, bg_p_o, bg_p_t, soft_mask_t)
+    loss_dense_fg = 0.5 * (loss_fg_o + loss_fg_t)
 
     # --- B. CĂN CHỈNH TỪNG PIXEL HẬU CẢNH ---
-    pos_bg_o = (sim_bg_o_raw - m_pos) / tau_dense
-    neg_bg_o_1 = (sim_fg_o_raw + m_neg) / tau_dense
-    neg_bg_o_2 = ((base_norm * fg_p_o).sum(dim=1, keepdim=True) + m_neg) / tau_dense
-    loss_bg_map_o = torch.logsumexp(torch.stack([pos_bg_o, neg_bg_o_1, neg_bg_o_2], dim=-1), dim=-1) - pos_bg_o
+    loss_bg_o = robust_gce_loss(base_norm, bg_p_t, fg_p_t, fg_p_o, bg_mask_o)
+    loss_bg_t = robust_gce_loss(trans_norm, bg_p_o, fg_p_o, fg_p_t, bg_mask_t)
+    loss_dense_bg = 0.5 * (loss_bg_o + loss_bg_t)
 
-    pos_bg_t = (sim_bg_t_raw - m_pos) / tau_dense
-    neg_bg_t_1 = (sim_fg_t_raw + m_neg) / tau_dense
-    neg_bg_t_2 = ((trans_norm * fg_p_t).sum(dim=1, keepdim=True) + m_neg) / tau_dense
-    loss_bg_map_t = torch.logsumexp(torch.stack([pos_bg_t, neg_bg_t_1, neg_bg_t_2], dim=-1), dim=-1) - pos_bg_t
-
-    loss_dense_bg = 0.5 * ((loss_bg_map_o * eff_mask_bg_o).sum() / (eff_mask_bg_o.sum() + 1e-6) +
-                           (loss_bg_map_t * eff_mask_bg_t).sum() / (eff_mask_bg_t.sum() + 1e-6))
-
-    # Tỷ lệ tổng hợp: Gọn gàng và mạnh mẽ nhất
+    # Tỷ lệ tổng hợp: Thuần khiết và toán học hóa 100%
     return loss_global_fg + 0.2 * loss_global_bg + 0.5 * loss_dense_fg + 0.2 * loss_dense_bg
 
 # -------------------hàm Lp ban đầu------------
