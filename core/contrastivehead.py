@@ -167,11 +167,12 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     assert b == k * aug, 'provide correct k and aug such that dim0=k*aug'
 
     # ==========================================
-    # 1. TÍNH TOÁN PROTOTYPE THÔ & GLOBAL LOSS
+    # 1. TÍNH PROTOTYPE TOÀN CỤC (Average Pooling - Global Context)
     # ==========================================
     fg_proto_o, bg_proto_o = augwise_proto(base, mask_base, k, aug)
     fg_proto_t, bg_proto_t = augwise_proto(transformed, mask_transformed, k, aug)
 
+    # 2. GLOBAL LOSS (Giữ bức tranh vĩ mô)
     pos_fg = torch.exp(ssim(fg_proto_o, fg_proto_t) / tau_p)
     neg_bg_o = 0.5 * (torch.exp(ssim(fg_proto_o, bg_proto_t) / tau_p) + torch.exp(ssim(fg_proto_o, bg_proto_o) / tau_p))
     neg_bg_t = 0.5 * (torch.exp(ssim(fg_proto_t, bg_proto_o) / tau_p) + torch.exp(ssim(fg_proto_t, bg_proto_t) / tau_p))
@@ -182,74 +183,73 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     loss_global_bg = -torch.log(pos_bg / (pos_bg + neg_bg_cross)).mean()
 
     # ==========================================
-    # 2. CROSS-VIEW ATTENTION (Tạo Mỏ neo Siêu sạch)
+    # 3. EXTREMUM-GUIDED ANCHORS (Đột phá V34: Mỏ neo Cực trị)
     # ==========================================
-    base_norm = F.normalize(base, p=2, dim=1)
-    trans_norm = F.normalize(transformed, p=2, dim=1)
-
-    # Đóng băng các Prototype thô để làm "Truy vấn" (Query) tĩnh
-    raw_fg_o = F.normalize(fg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
-    raw_bg_o = F.normalize(bg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
-    raw_fg_t = F.normalize(fg_proto_t, p=2, dim=-1).view(b, c, 1, 1).detach()
-    raw_bg_t = F.normalize(bg_proto_t, p=2, dim=-1).view(b, c, 1, 1).detach()
-
+    base_flat = base.view(b, c, -1)
+    trans_flat = transformed.view(b, c, -1)
+    
     soft_mask_o = segutils.downsample_mask(mask_base, h, w).unsqueeze(1)
     soft_mask_t = segutils.downsample_mask(mask_transformed, h, w).unsqueeze(1)
+    mb_flat = soft_mask_o.view(b, 1, -1)
+    mt_flat = soft_mask_t.view(b, 1, -1)
+
+    # --- Trích xuất Max Pooling (Bắt chi tiết sắc nhọn, phớt lờ rác viền) ---
+    # Foreground Max (Thay thế rác bằng -1e4 để hàm max lờ đi)
+    fg_max_o = base_flat.masked_fill(mb_flat < 0.5, -1e4).max(dim=2)[0]
+    fg_max_t = trans_flat.masked_fill(mt_flat < 0.5, -1e4).max(dim=2)[0]
+    
+    # Background Max (Tạo ra Mỏ neo Hard Negative - đỉnh nhiễu nguy hiểm nhất của nền)
+    bg_max_o = base_flat.masked_fill(mb_flat >= 0.5, -1e4).max(dim=2)[0]
+    bg_max_t = trans_flat.masked_fill(mt_flat >= 0.5, -1e4).max(dim=2)[0]
+
+    # --- Dung hợp (Synergy): Average (Ngữ nghĩa) + Max (Độ sắc lẹm) ---
+    fg_p_o = F.normalize(fg_proto_o + fg_max_o, p=2, dim=-1).view(b, c, 1, 1).detach()
+    bg_p_o = F.normalize(bg_proto_o + bg_max_o, p=2, dim=-1).view(b, c, 1, 1).detach()
+    fg_p_t = F.normalize(fg_proto_t + fg_max_t, p=2, dim=-1).view(b, c, 1, 1).detach()
+    bg_p_t = F.normalize(bg_proto_t + bg_max_t, p=2, dim=-1).view(b, c, 1, 1).detach()
+
+    # ==========================================
+    # 4. MARGIN PIXEL-TO-PROTOTYPE (Kế thừa sức mạnh vô song của V21)
+    # ==========================================
+    tau_dense = 0.2
+    m_pos = 0.15 
+    m_neg = 0.05 
+    
+    base_norm = F.normalize(base, p=2, dim=1)
+    trans_norm = F.normalize(transformed, p=2, dim=1)
+    
     bg_mask_o = torch.clamp(1.0 - soft_mask_o, min=0.0, max=1.0)
     bg_mask_t = torch.clamp(1.0 - soft_mask_t, min=0.0, max=1.0)
 
-    tau_attn = 0.1 # Nhiệt độ thấp ép Attention chỉ tập trung vào các pixel Lõi thuần khiết nhất
-    
-    # Lọc ảnh Gốc (O) bằng Truy vấn từ ảnh Biến đổi (T) -> Rác nhãn bị chặn hoàn toàn
-    weight_fg_o = torch.exp((base_norm * raw_fg_t).sum(dim=1, keepdim=True) / tau_attn) * soft_mask_o
-    clean_fg_o = F.normalize((base * weight_fg_o).sum(dim=(2,3)), p=2, dim=1).view(b, c, 1, 1).detach()
-    
-    weight_bg_o = torch.exp((base_norm * raw_bg_t).sum(dim=1, keepdim=True) / tau_attn) * bg_mask_o
-    clean_bg_o = F.normalize((base * weight_bg_o).sum(dim=(2,3)), p=2, dim=1).view(b, c, 1, 1).detach()
-
-    # Lọc ảnh Biến đổi (T) bằng Truy vấn từ ảnh Gốc (O)
-    weight_fg_t = torch.exp((trans_norm * raw_fg_o).sum(dim=1, keepdim=True) / tau_attn) * soft_mask_t
-    clean_fg_t = F.normalize((transformed * weight_fg_t).sum(dim=(2,3)), p=2, dim=1).view(b, c, 1, 1).detach()
-    
-    weight_bg_t = torch.exp((trans_norm * raw_bg_o).sum(dim=1, keepdim=True) / tau_attn) * bg_mask_t
-    clean_bg_t = F.normalize((transformed * weight_bg_t).sum(dim=(2,3)), p=2, dim=1).view(b, c, 1, 1).detach()
-
-    # ==========================================
-    # 3. MARGIN PIXEL-TO-PROTOTYPE (Khai phóng sức mạnh tuyệt đối)
-    # ==========================================
-    tau_dense = 0.2
-    m_pos = 0.15  # Trở lại Margin mạnh mẽ của V21
-    m_neg = 0.05 
-
-    # --- A. CĂN CHỈNH TỪNG PIXEL TIỀN CẢNH (Dùng Mỏ neo Siêu sạch) ---
-    pos_fg_o = ((base_norm * clean_fg_t).sum(dim=1, keepdim=True) - m_pos) / tau_dense
-    neg_fg_o_1 = ((base_norm * clean_bg_t).sum(dim=1, keepdim=True) + m_neg) / tau_dense
-    neg_fg_o_2 = ((base_norm * clean_bg_o).sum(dim=1, keepdim=True) + m_neg) / tau_dense
-    # KHÔNG DÙNG BẤT KỲ GATE HAY WEIGHT NÀO Ở LOSS NÀY. Áp lực tuyệt đối lên toàn bộ soft_mask!
+    # --- A. CĂN CHỈNH TỪNG PIXEL TIỀN CẢNH (Dùng Mỏ neo Cực trị) ---
+    pos_fg_o = ((base_norm * fg_p_t).sum(dim=1, keepdim=True) - m_pos) / tau_dense
+    neg_fg_o_1 = ((base_norm * bg_p_t).sum(dim=1, keepdim=True) + m_neg) / tau_dense
+    neg_fg_o_2 = ((base_norm * bg_p_o).sum(dim=1, keepdim=True) + m_neg) / tau_dense
     loss_fg_map_o = torch.logsumexp(torch.stack([pos_fg_o, neg_fg_o_1, neg_fg_o_2], dim=-1), dim=-1) - pos_fg_o
 
-    pos_fg_t = ((trans_norm * clean_fg_o).sum(dim=1, keepdim=True) - m_pos) / tau_dense
-    neg_fg_t_1 = ((trans_norm * clean_bg_o).sum(dim=1, keepdim=True) + m_neg) / tau_dense
-    neg_fg_t_2 = ((trans_norm * clean_bg_t).sum(dim=1, keepdim=True) + m_neg) / tau_dense
+    pos_fg_t = ((trans_norm * fg_p_o).sum(dim=1, keepdim=True) - m_pos) / tau_dense
+    neg_fg_t_1 = ((trans_norm * bg_p_o).sum(dim=1, keepdim=True) + m_neg) / tau_dense
+    neg_fg_t_2 = ((trans_norm * bg_p_t).sum(dim=1, keepdim=True) + m_neg) / tau_dense
     loss_fg_map_t = torch.logsumexp(torch.stack([pos_fg_t, neg_fg_t_1, neg_fg_t_2], dim=-1), dim=-1) - pos_fg_t
 
     loss_dense_fg = 0.5 * ((loss_fg_map_o * soft_mask_o).sum() / (soft_mask_o.sum() + 1e-6) +
                            (loss_fg_map_t * soft_mask_t).sum() / (soft_mask_t.sum() + 1e-6))
 
     # --- B. CĂN CHỈNH TỪNG PIXEL HẬU CẢNH ---
-    pos_bg_o = ((base_norm * clean_bg_t).sum(dim=1, keepdim=True) - m_pos) / tau_dense
-    neg_bg_o_1 = ((base_norm * clean_fg_t).sum(dim=1, keepdim=True) + m_neg) / tau_dense
-    neg_bg_o_2 = ((base_norm * clean_fg_o).sum(dim=1, keepdim=True) + m_neg) / tau_dense
+    pos_bg_o = ((base_norm * bg_p_t).sum(dim=1, keepdim=True) - m_pos) / tau_dense
+    neg_bg_o_1 = ((base_norm * fg_p_t).sum(dim=1, keepdim=True) + m_neg) / tau_dense
+    neg_bg_o_2 = ((base_norm * fg_p_o).sum(dim=1, keepdim=True) + m_neg) / tau_dense
     loss_bg_map_o = torch.logsumexp(torch.stack([pos_bg_o, neg_bg_o_1, neg_bg_o_2], dim=-1), dim=-1) - pos_bg_o
 
-    pos_bg_t = ((trans_norm * clean_bg_o).sum(dim=1, keepdim=True) - m_pos) / tau_dense
-    neg_bg_t_1 = ((trans_norm * clean_fg_o).sum(dim=1, keepdim=True) + m_neg) / tau_dense
-    neg_bg_t_2 = ((trans_norm * clean_fg_t).sum(dim=1, keepdim=True) + m_neg) / tau_dense
+    pos_bg_t = ((trans_norm * bg_p_o).sum(dim=1, keepdim=True) - m_pos) / tau_dense
+    neg_bg_t_1 = ((trans_norm * fg_p_o).sum(dim=1, keepdim=True) + m_neg) / tau_dense
+    neg_bg_t_2 = ((trans_norm * fg_p_t).sum(dim=1, keepdim=True) + m_neg) / tau_dense
     loss_bg_map_t = torch.logsumexp(torch.stack([pos_bg_t, neg_bg_t_1, neg_bg_t_2], dim=-1), dim=-1) - pos_bg_t
 
     loss_dense_bg = 0.5 * ((loss_bg_map_o * bg_mask_o).sum() / (bg_mask_o.sum() + 1e-6) +
                            (loss_bg_map_t * bg_mask_t).sum() / (bg_mask_t.sum() + 1e-6))
 
+    # Tỷ lệ tổng hợp
     return loss_global_fg + 0.2 * loss_global_bg + 0.5 * loss_dense_fg + 0.2 * loss_dense_bg
 
 # -------------------hàm Lp ban đầu------------
