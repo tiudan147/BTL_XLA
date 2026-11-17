@@ -166,11 +166,15 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     b, c, h, w = base.shape
     assert b == k * aug, 'provide correct k and aug such that dim0=k*aug'
 
-    # 1. TÍNH TOÁN PROTOTYPE TOÀN CỤC 
+    # ==========================================
+    # 1. TÍNH TOÁN PROTOTYPE TOÀN CỤC (Anchor tĩnh)
+    # ==========================================
     fg_proto_o, bg_proto_o = augwise_proto(base, mask_base, k, aug)
     fg_proto_t, bg_proto_t = augwise_proto(transformed, mask_transformed, k, aug)
 
-    # 2. GLOBAL LOSS
+    # ==========================================
+    # 2. GLOBAL LOSS (Duy trì bức tranh tổng thể)
+    # ==========================================
     pos_fg = torch.exp(ssim(fg_proto_o, fg_proto_t) / tau_p)
     neg_bg_o = 0.5 * (torch.exp(ssim(fg_proto_o, bg_proto_t) / tau_p) + torch.exp(ssim(fg_proto_o, bg_proto_o) / tau_p))
     neg_bg_t = 0.5 * (torch.exp(ssim(fg_proto_t, bg_proto_o) / tau_p) + torch.exp(ssim(fg_proto_t, bg_proto_t) / tau_p))
@@ -181,11 +185,12 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     loss_global_bg = -torch.log(pos_bg / (pos_bg + neg_bg_cross)).mean()
 
     # ==========================================
-    # 3. ĐỘT PHÁ V21: Margin-Injected Pixel-to-Prototype (MiP2P)
+    # 3. FOCAL-MARGIN PIXEL-TO-PROTOTYPE (Lưỡi dao gọt biên tuyệt đối)
     # ==========================================
     tau_dense = 0.2
-    m_pos = 0.15 # Ép cụm Tiền cảnh siêu chặt (Trừ vào Positive)
-    m_neg = 0.05 # Đẩy Hậu cảnh ra xa hơn (Cộng vào Negative)
+    m_pos = 0.15 # Margin co cụm
+    m_neg = 0.05 # Margin phân tách
+    gamma = 2.0  # Hệ số hội tụ tiêu điểm (Focal Gamma)
     
     base_norm = F.normalize(base, p=2, dim=1)
     trans_norm = F.normalize(transformed, p=2, dim=1)
@@ -199,44 +204,44 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     soft_mask_o = segutils.downsample_mask(mask_base, h, w).unsqueeze(1)
     soft_mask_t = segutils.downsample_mask(mask_transformed, h, w).unsqueeze(1)
 
-    # --- A. CĂN CHỈNH TỪNG PIXEL TIỀN CẢNH (Với CosFace Margin) ---
-    # Ảnh gốc
-    pos_fg_o_dense = ((base_norm * fg_p_t_stat).sum(dim=1, keepdim=True) - m_pos) / tau_dense
+    # Hàm nội suy Focal Loss cục bộ
+    def focal_dense_loss(pos_logits, neg_logits_1, neg_logits_2):
+        lse = torch.logsumexp(torch.stack([pos_logits, neg_logits_1, neg_logits_2], dim=-1), dim=-1)
+        raw_loss = lse - pos_logits
+        p = torch.exp(-raw_loss) # Chuyển Loss về lại không gian xác suất
+        focal_weight = (1.0 - p) ** gamma # Đánh trọng số: Càng dễ đoán, phạt càng nhẹ
+        return focal_weight * raw_loss
+
+    # --- A. CĂN CHỈNH TỪNG PIXEL TIỀN CẢNH ---
+    pos_fg_o = ((base_norm * fg_p_t_stat).sum(dim=1, keepdim=True) - m_pos) / tau_dense
     neg_fg_o_1 = ((base_norm * bg_p_t_stat).sum(dim=1, keepdim=True) + m_neg) / tau_dense
     neg_fg_o_2 = ((base_norm * bg_p_o_stat).sum(dim=1, keepdim=True) + m_neg) / tau_dense
-    lse_fg_o = torch.logsumexp(torch.stack([pos_fg_o_dense, neg_fg_o_1, neg_fg_o_2], dim=-1), dim=-1)
-    loss_fg_map_o = lse_fg_o - pos_fg_o_dense
+    focal_loss_fg_o = focal_dense_loss(pos_fg_o, neg_fg_o_1, neg_fg_o_2)
 
-    # Ảnh biến đổi
-    pos_fg_t_dense = ((trans_norm * fg_p_o_stat).sum(dim=1, keepdim=True) - m_pos) / tau_dense
+    pos_fg_t = ((trans_norm * fg_p_o_stat).sum(dim=1, keepdim=True) - m_pos) / tau_dense
     neg_fg_t_1 = ((trans_norm * bg_p_o_stat).sum(dim=1, keepdim=True) + m_neg) / tau_dense
     neg_fg_t_2 = ((trans_norm * bg_p_t_stat).sum(dim=1, keepdim=True) + m_neg) / tau_dense
-    lse_fg_t = torch.logsumexp(torch.stack([pos_fg_t_dense, neg_fg_t_1, neg_fg_t_2], dim=-1), dim=-1)
-    loss_fg_map_t = lse_fg_t - pos_fg_t_dense
+    focal_loss_fg_t = focal_dense_loss(pos_fg_t, neg_fg_t_1, neg_fg_t_2)
 
-    loss_dense_fg = 0.5 * ((loss_fg_map_o * soft_mask_o).sum() / (soft_mask_o.sum() + 1e-6) +
-                           (loss_fg_map_t * soft_mask_t).sum() / (soft_mask_t.sum() + 1e-6))
+    loss_dense_fg = 0.5 * ((focal_loss_fg_o * soft_mask_o).sum() / (soft_mask_o.sum() + 1e-6) +
+                           (focal_loss_fg_t * soft_mask_t).sum() / (soft_mask_t.sum() + 1e-6))
 
-    # --- B. CĂN CHỈNH TỪNG PIXEL HẬU CẢNH (Với CosFace Margin) ---
+    # --- B. CĂN CHỈNH TỪNG PIXEL HẬU CẢNH ---
     bg_mask_o = torch.clamp(1.0 - soft_mask_o, min=0.0, max=1.0)
     bg_mask_t = torch.clamp(1.0 - soft_mask_t, min=0.0, max=1.0)
 
-    # Ảnh gốc
-    pos_bg_o_dense = ((base_norm * bg_p_t_stat).sum(dim=1, keepdim=True) - m_pos) / tau_dense
+    pos_bg_o = ((base_norm * bg_p_t_stat).sum(dim=1, keepdim=True) - m_pos) / tau_dense
     neg_bg_o_1 = ((base_norm * fg_p_t_stat).sum(dim=1, keepdim=True) + m_neg) / tau_dense
     neg_bg_o_2 = ((base_norm * fg_p_o_stat).sum(dim=1, keepdim=True) + m_neg) / tau_dense
-    lse_bg_o = torch.logsumexp(torch.stack([pos_bg_o_dense, neg_bg_o_1, neg_bg_o_2], dim=-1), dim=-1)
-    loss_bg_map_o = lse_bg_o - pos_bg_o_dense
+    focal_loss_bg_o = focal_dense_loss(pos_bg_o, neg_bg_o_1, neg_bg_o_2)
 
-    # Ảnh biến đổi
-    pos_bg_t_dense = ((trans_norm * bg_p_o_stat).sum(dim=1, keepdim=True) - m_pos) / tau_dense
+    pos_bg_t = ((trans_norm * bg_p_o_stat).sum(dim=1, keepdim=True) - m_pos) / tau_dense
     neg_bg_t_1 = ((trans_norm * fg_p_o_stat).sum(dim=1, keepdim=True) + m_neg) / tau_dense
     neg_bg_t_2 = ((trans_norm * fg_p_t_stat).sum(dim=1, keepdim=True) + m_neg) / tau_dense
-    lse_bg_t = torch.logsumexp(torch.stack([pos_bg_t_dense, neg_bg_t_1, neg_bg_t_2], dim=-1), dim=-1)
-    loss_bg_map_t = lse_bg_t - pos_bg_t_dense
+    focal_loss_bg_t = focal_dense_loss(pos_bg_t, neg_bg_t_1, neg_bg_t_2)
 
-    loss_dense_bg = 0.5 * ((loss_bg_map_o * bg_mask_o).sum() / (bg_mask_o.sum() + 1e-6) +
-                           (loss_bg_map_t * bg_mask_t).sum() / (bg_mask_t.sum() + 1e-6))
+    loss_dense_bg = 0.5 * ((focal_loss_bg_o * bg_mask_o).sum() / (bg_mask_o.sum() + 1e-6) +
+                           (focal_loss_bg_t * bg_mask_t).sum() / (bg_mask_t.sum() + 1e-6))
 
     # Tỷ lệ tổng hợp
     return loss_global_fg + 0.2 * loss_global_bg + 0.5 * loss_dense_fg + 0.2 * loss_dense_bg
