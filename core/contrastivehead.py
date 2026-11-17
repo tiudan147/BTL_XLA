@@ -166,11 +166,15 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     b, c, h, w = base.shape
     assert b == k * aug, 'provide correct k and aug such that dim0=k*aug'
 
-    # 1. TÍNH TOÁN PROTOTYPE TOÀN CỤC
+    # ==========================================
+    # 1. TÍNH TOÁN PROTOTYPE TOÀN CỤC (Anchor tĩnh)
+    # ==========================================
     fg_proto_o, bg_proto_o = augwise_proto(base, mask_base, k, aug)
     fg_proto_t, bg_proto_t = augwise_proto(transformed, mask_transformed, k, aug)
 
-    # 2. GLOBAL LOSS (Duy trì cấu trúc vĩ mô)
+    # ==========================================
+    # 2. GLOBAL LOSS VÀ ORTHOGONAL PENALTY (Vũ khí giải cứu Lung)
+    # ==========================================
     pos_fg = torch.exp(ssim(fg_proto_o, fg_proto_t) / tau_p)
     neg_bg_o = 0.5 * (torch.exp(ssim(fg_proto_o, bg_proto_t) / tau_p) + torch.exp(ssim(fg_proto_o, bg_proto_o) / tau_p))
     neg_bg_t = 0.5 * (torch.exp(ssim(fg_proto_t, bg_proto_o) / tau_p) + torch.exp(ssim(fg_proto_t, bg_proto_t) / tau_p))
@@ -180,8 +184,11 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     neg_bg_cross = 0.5 * (torch.exp(ssim(bg_proto_o, fg_proto_t) / tau_p) + torch.exp(ssim(bg_proto_t, fg_proto_o) / tau_p))
     loss_global_bg = -torch.log(pos_bg / (pos_bg + neg_bg_cross)).mean()
 
+    # TRỰC GIAO HÓA (Ép FG và BG vuông góc 90 độ, dập tắt nhầm lẫn xương/phổi)
+    loss_ortho = 0.5 * (F.relu(ssim(fg_proto_o, bg_proto_o)) + F.relu(ssim(fg_proto_t, bg_proto_t))).mean()
+
     # ==========================================
-    # 3. ĐỘT PHÁ V25: Boundary-Aware Margin Pixel-to-Prototype
+    # 3. BOUNDARY-AWARE MARGIN PIXEL-TO-PROTOTYPE (MiP2P - Quyền năng của V25)
     # ==========================================
     tau_dense = 0.2
     m_pos = 0.15 
@@ -190,7 +197,6 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     base_norm = F.normalize(base, p=2, dim=1)
     trans_norm = F.normalize(transformed, p=2, dim=1)
 
-    # Đóng băng Mỏ neo (Trạm hải đăng tĩnh bảo vệ khỏi sụp đổ)
     fg_p_o_stat = F.normalize(fg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
     bg_p_o_stat = F.normalize(bg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
     fg_p_t_stat = F.normalize(fg_proto_t, p=2, dim=-1).view(b, c, 1, 1).detach()
@@ -199,21 +205,18 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     soft_mask_o = segutils.downsample_mask(mask_base, h, w).unsqueeze(1)
     soft_mask_t = segutils.downsample_mask(mask_transformed, h, w).unsqueeze(1)
     
-    # --- BỘ LỌC RANH GIỚI BẰNG THỊ GIÁC MÁY TÍNH (Boundary-Aware Certainty) ---
+    # --- BỘ LỌC RANH GIỚI BẰNG THỊ GIÁC MÁY TÍNH ---
     kernel_size = 5
     padding = kernel_size // 2
     
-    # Tính độ bất định ảnh Gốc
     blurred_mask_o = F.avg_pool2d(soft_mask_o, kernel_size, stride=1, padding=padding)
     uncertainty_o = torch.abs(soft_mask_o - blurred_mask_o)
-    certainty_o = torch.exp(-5.0 * uncertainty_o) # Vùng biên uncertainty cao -> trọng số phạt trôi về 0
+    certainty_o = torch.exp(-5.0 * uncertainty_o) 
     
-    # Tính độ bất định ảnh Biến đổi
     blurred_mask_t = F.avg_pool2d(soft_mask_t, kernel_size, stride=1, padding=padding)
     uncertainty_t = torch.abs(soft_mask_t - blurred_mask_t)
     certainty_t = torch.exp(-5.0 * uncertainty_t)
 
-    # Lồng ghép độ tự tin vào Mask
     eff_mask_fg_o = soft_mask_o * certainty_o
     eff_mask_fg_t = soft_mask_t * certainty_t
     
@@ -222,7 +225,7 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     eff_mask_bg_o = bg_mask_o * certainty_o
     eff_mask_bg_t = bg_mask_t * certainty_t
 
-    # --- A. CĂN CHỈNH TỪNG PIXEL TIỀN CẢNH (MiP2P V21) ---
+    # --- A. CĂN CHỈNH TỪNG PIXEL TIỀN CẢNH ---
     pos_fg_o = ((base_norm * fg_p_t_stat).sum(dim=1, keepdim=True) - m_pos) / tau_dense
     neg_fg_o_1 = ((base_norm * bg_p_t_stat).sum(dim=1, keepdim=True) + m_neg) / tau_dense
     neg_fg_o_2 = ((base_norm * bg_p_o_stat).sum(dim=1, keepdim=True) + m_neg) / tau_dense
@@ -233,11 +236,10 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     neg_fg_t_2 = ((trans_norm * bg_p_t_stat).sum(dim=1, keepdim=True) + m_neg) / tau_dense
     loss_fg_map_t = torch.logsumexp(torch.stack([pos_fg_t, neg_fg_t_1, neg_fg_t_2], dim=-1), dim=-1) - pos_fg_t
 
-    # Áp dụng Effective Mask để mô hình né học rác ranh giới
     loss_dense_fg = 0.5 * ((loss_fg_map_o * eff_mask_fg_o).sum() / (eff_mask_fg_o.sum() + 1e-6) +
                            (loss_fg_map_t * eff_mask_fg_t).sum() / (eff_mask_fg_t.sum() + 1e-6))
 
-    # --- B. CĂN CHỈNH TỪNG PIXEL HẬU CẢNH (MiP2P V21) ---
+    # --- B. CĂN CHỈNH TỪNG PIXEL HẬU CẢNH ---
     pos_bg_o = ((base_norm * bg_p_t_stat).sum(dim=1, keepdim=True) - m_pos) / tau_dense
     neg_bg_o_1 = ((base_norm * fg_p_t_stat).sum(dim=1, keepdim=True) + m_neg) / tau_dense
     neg_bg_o_2 = ((base_norm * fg_p_o_stat).sum(dim=1, keepdim=True) + m_neg) / tau_dense
@@ -251,8 +253,8 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     loss_dense_bg = 0.5 * ((loss_bg_map_o * eff_mask_bg_o).sum() / (eff_mask_bg_o.sum() + 1e-6) +
                            (loss_bg_map_t * eff_mask_bg_t).sum() / (eff_mask_bg_t.sum() + 1e-6))
 
-    # Tỷ lệ tổng hợp
-    return loss_global_fg + 0.2 * loss_global_bg + 0.5 * loss_dense_fg + 0.2 * loss_dense_bg
+    # Tỷ lệ tổng hợp: Thêm 0.3 * loss_ortho để gia cố bộ khung vĩ mô cho Lung
+    return loss_global_fg + 0.2 * loss_global_bg + 0.3 * loss_ortho + 0.5 * loss_dense_fg + 0.2 * loss_dense_bg
 
 # -------------------hàm Lp ban đầu------------
 # features of base, transformed: [b,c,h,w]
