@@ -166,13 +166,12 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     b, c, h, w = base.shape
     assert b == k * aug, 'provide correct k and aug such that dim0=k*aug'
 
-    # 1. Global Prototypes (Nền tảng ổn định)
+    # 1. Global Prototypes
     fg_proto_o, bg_proto_o = augwise_proto(base, mask_base, k, aug)
     fg_proto_t, bg_proto_t = augwise_proto(transformed, mask_transformed, k, aug)
 
     pos_fg = torch.exp(ssim(fg_proto_o, fg_proto_t) / tau_p)
 
-    # 2. Adaptive Hard-Background & Local Grid (CHỈ kích hoạt ở tầng L, M)
     neg_hard_o = 0.0
     neg_hard_t = 0.0
     loss_local = 0.0
@@ -182,7 +181,6 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
         feat_t_aug = torch.cat(transformed.view(k, aug, c, h * w).unbind(0), dim=-1)
         mask_aug = torch.cat(segutils.downsample_mask(mask_base, h, w).view(k, aug, h * w).unbind(0), dim=-1)
         
-        # ĐỘT PHÁ 1: Soft Mask (Label Smoothing tự nhiên)
         bg_mask = torch.clamp(1.0 - mask_aug, min=0.0, max=1.0)
         
         feat_o_norm = F.normalize(feat_o_aug, p=2, dim=1)
@@ -193,7 +191,6 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
         sim_pixel_o = torch.sum(feat_o_norm * fg_o_norm.detach(), dim=1)
         sim_pixel_t = torch.sum(feat_t_norm * fg_t_norm.detach(), dim=1)
         
-        # Chỉ che những pixel có bg_mask rất nhỏ (< 0.1) để giữ lại viền mềm
         logits_bg_o = (sim_pixel_o / tau_hard).masked_fill(bg_mask < 0.1, -1e4)
         logits_bg_t = (sim_pixel_t / tau_hard).masked_fill(bg_mask < 0.1, -1e4)
         
@@ -208,15 +205,28 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
         neg_hard_o = 0.5 * (torch.exp(ssim(fg_proto_o, bg_hard_t) / tau_p) + torch.exp(ssim(fg_proto_o, bg_hard_o) / tau_p))
         neg_hard_t = 0.5 * (torch.exp(ssim(fg_proto_t, bg_hard_o) / tau_p) + torch.exp(ssim(fg_proto_t, bg_hard_t) / tau_p))
         
-        # ĐỘT PHÁ 2: Confident Local Grid (Nâng ngưỡng lên 0.5 - Bỏ qua vùng nhãn lỗi của Deepglobe)
+        # ĐỘT PHÁ V6: L2G-Margin (Local-to-Global Contrastive with Margin)
         mask_4d = segutils.downsample_mask(mask_base, h, w).unsqueeze(1).float()
         grid_area = F.adaptive_avg_pool2d(mask_4d, (2, 2))
         valid_zones = (grid_area > 0.5).float().squeeze(1).view(b, 4)
         
         local_fg_o = (F.adaptive_avg_pool2d(base * mask_4d, (2, 2)) / (grid_area + 1e-6)).view(b, c, 4)
         local_fg_t = (F.adaptive_avg_pool2d(transformed * mask_4d, (2, 2)) / (grid_area + 1e-6)).view(b, c, 4)
+        
+        # Nhánh 1: Đồng nhất Tiền cảnh cục bộ (Local Positives)
         local_sim = F.cosine_similarity(local_fg_o, local_fg_t, dim=1)
-        loss_local = ((1.0 - local_sim) * valid_zones).sum() / (valid_zones.sum() + 1e-6)
+        loss_local_pos = ((1.0 - local_sim) * valid_zones).sum() / (valid_zones.sum() + 1e-6)
+        
+        # Nhánh 2: Đẩy lùi Nền toàn cục với Margin = 0.15 (Local-to-Global Negatives)
+        margin = 0.15
+        bg_o_expanded = bg_proto_o.unsqueeze(-1) # [b, c, 1]
+        bg_t_expanded = bg_proto_t.unsqueeze(-1) # [b, c, 1]
+        
+        neg_l2g_o = F.relu(F.cosine_similarity(local_fg_o, bg_t_expanded, dim=1) - margin)
+        neg_l2g_t = F.relu(F.cosine_similarity(local_fg_t, bg_o_expanded, dim=1) - margin)
+        loss_local_neg = ((neg_l2g_o + neg_l2g_t) * valid_zones).sum() / (valid_zones.sum() + 1e-6)
+        
+        loss_local = loss_local_pos + 0.5 * loss_local_neg
 
     # 3. Tổng hợp Symmetric Foreground Loss
     neg_bg_o = 0.5 * (torch.exp(ssim(fg_proto_o, bg_proto_t) / tau_p) + torch.exp(ssim(fg_proto_o, bg_proto_o) / tau_p))
@@ -231,7 +241,8 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     neg_bg_cross = 0.5 * (torch.exp(ssim(bg_proto_o, fg_proto_t) / tau_p) + torch.exp(ssim(bg_proto_t, fg_proto_o) / tau_p))
     loss_bg = -torch.log(pos_bg / (pos_bg + neg_bg_cross)).mean()
 
-    return loss_fg + 0.2 * loss_bg + 0.25 * loss_local
+    # Tăng nhẹ trọng số của loss_local lên 0.3 để L2G Margin phát huy trên Deepglobe
+    return loss_fg + 0.2 * loss_bg + 0.3 * loss_local
 
 # -------------------hàm Lp ban đầu------------
 # features of base, transformed: [b,c,h,w]
