@@ -161,73 +161,48 @@ def self_attention_loss(f_base, f_transformed, mask_base, mask_transformed, k, a
 #            Nơi định nghĩa hàm loss Lp
 #------------------------------------------------
 
-def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, aug, tau_p=0.5, tau_hard=0.3):
+def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, aug, tau_p=0.8):
     assert transformed.shape == base.shape, ".."
     b, c, h, w = base.shape
     assert b == k * aug, 'provide correct k and aug such that dim0=k*aug'
     assert mask_base.shape == mask_transformed.shape == (b, h, w), ".."
 
-    # 1. Global Prototypes (Tận dụng đầy đủ cả bg_proto_o và bg_proto_t)
+    # 1. Global Prototypes chuẩn xác từ augwise_proto (Không cắt ngưỡng cứng gây hại viền)
     fg_proto_o, bg_proto_o = augwise_proto(base, mask_base, k, aug)
     fg_proto_t, bg_proto_t = augwise_proto(transformed, mask_transformed, k, aug)
 
-    # 2. Attentive Hard-Background Prototype (Tự động bắt các pixel nền dễ nhầm lẫn nhất)
-    feat_o_aug = torch.cat(base.view(k, aug, c, h * w).unbind(0), dim=-1)          # [aug, c, k*h*w]
-    feat_t_aug = torch.cat(transformed.view(k, aug, c, h * w).unbind(0), dim=-1)   # [aug, c, k*h*w]
-    mask_aug = torch.cat(segutils.downsample_mask(mask_base, h, w).view(k, aug, h * w).unbind(0), dim=-1)
+    # 2. Symmetric Foreground Contrast (Kết hợp đẩy cả BG chéo và BG nội tại cùng thang đo)
+    pos_fg = torch.exp(ssim(fg_proto_o, fg_proto_t) / tau_p)
+    
+    # Trung bình cộng lực đẩy inter-view (fg_o <-> bg_t) và intra-view (fg_o <-> bg_o)
+    neg_fg_o = 0.5 * (torch.exp(ssim(fg_proto_o, bg_proto_t) / tau_p) + torch.exp(ssim(fg_proto_o, bg_proto_o) / tau_p))
+    neg_fg_t = 0.5 * (torch.exp(ssim(fg_proto_t, bg_proto_o) / tau_p) + torch.exp(ssim(fg_proto_t, bg_proto_t) / tau_p))
 
-    bg_mask = (mask_aug <= 0.5).float()  # [aug, k*h*w]
+    loss_fg_o = -torch.log(pos_fg / (pos_fg + neg_fg_o))
+    loss_fg_t = -torch.log(pos_fg / (pos_fg + neg_fg_t))
+    loss_fg = 0.5 * (loss_fg_o + loss_fg_t).mean()
 
-    # Chuẩn hóa L2 để đo độ tương đồng giữa từng pixel nền với FG prototype
-    feat_o_norm = F.normalize(feat_o_aug, p=2, dim=1)
-    feat_t_norm = F.normalize(feat_t_aug, p=2, dim=1)
-    fg_o_norm = F.normalize(fg_proto_o, p=2, dim=-1).unsqueeze(-1)  # [aug, c, 1]
-    fg_t_norm = F.normalize(fg_proto_t, p=2, dim=-1).unsqueeze(-1)  # [aug, c, 1]
+    # 3. Background View-Consistency (Giữ cụm nền ổn định cho Softmax ở bước Dense Comparison)
+    pos_bg = torch.exp(ssim(bg_proto_o, bg_proto_t) / tau_p)
+    neg_bg = 0.5 * (torch.exp(ssim(bg_proto_o, fg_proto_t) / tau_p) + torch.exp(ssim(bg_proto_t, fg_proto_o) / tau_p))
+    loss_bg = -torch.log(pos_bg / (pos_bg + neg_bg)).mean()
 
-    sim_pixel_o = torch.sum(feat_o_norm * fg_o_norm.detach(), dim=1)  # [aug, k*h*w]
-    sim_pixel_t = torch.sum(feat_t_norm * fg_t_norm.detach(), dim=1)  # [aug, k*h*w]
-
-    # Che vùng FG bằng -1e4 để Softmax chỉ tập trung đánh trọng số cho vùng BG khó
-    logits_bg_o = (sim_pixel_o / tau_hard).masked_fill(bg_mask < 0.5, -1e4)
-    logits_bg_t = (sim_pixel_t / tau_hard).masked_fill(bg_mask < 0.5, -1e4)
-
-    weights_bg_o = F.softmax(logits_bg_o, dim=-1) * bg_mask
-    weights_bg_o = weights_bg_o / (weights_bg_o.sum(dim=-1, keepdim=True) + 1e-6)
-
-    weights_bg_t = F.softmax(logits_bg_t, dim=-1) * bg_mask
-    weights_bg_t = weights_bg_t / (weights_bg_t.sum(dim=-1, keepdim=True) + 1e-6)
-
-    bg_hard_o = torch.einsum('acn,an->ac', feat_o_aug, weights_bg_o)  # [aug, c]
-    bg_hard_t = torch.einsum('acn,an->ac', feat_t_aug, weights_bg_t)  # [aug, c]
-
-    # 3. Symmetric Hard-Aware InfoNCE Loss với Temperature tau_p
-    pos_sim = ssim(fg_proto_o, fg_proto_t) / tau_p  # [aug]
-
-    neg_o_t = ssim(fg_proto_o, bg_proto_t) / tau_p
-    neg_t_o = ssim(fg_proto_t, bg_proto_o) / tau_p
-    neg_hard_o = ssim(fg_proto_o, bg_hard_t) / tau_p
-    neg_hard_t = ssim(fg_proto_t, bg_hard_o) / tau_p
-
-    # Dùng logsumexp để đảm bảo ổn định gradient tuyệt đối
-    loss_o2t = -pos_sim + torch.logsumexp(torch.stack([pos_sim, neg_o_t, neg_hard_o], dim=-1), dim=-1)
-    loss_t2o = -pos_sim + torch.logsumexp(torch.stack([pos_sim, neg_t_o, neg_hard_t], dim=-1), dim=-1)
-    loss_global = 0.5 * (loss_o2t + loss_t2o).mean()
-
-    # 4. Local Grid (2x2) Prototype Consistency (Bảo toàn đa dạng vùng cho Deepglobe & SUIM)
-    mask_4d = segutils.downsample_mask(mask_base, h, w).unsqueeze(1).float()  # [b, 1, h, w]
-    if h >= 2 and w >= 2:
-        grid_area = F.adaptive_avg_pool2d(mask_4d, (2, 2))  # [b, 1, 2, 2]
-        valid_zones = (grid_area > 0.05).float().squeeze(1).view(b, 4)  # Chỉ xét ô có ít nhất 5% pixel FG
+    # 4. Selective Local Grid 2x2: CHỈ bật ở các tầng nông & trung (L, M: h >= 20) cho Deepglobe/ISIC
+    # Tự động tắt ở tầng sâu (H: 13x13) để không làm vỡ vật thể nhỏ của SUIM và cấu trúc của Lung
+    if h >= 20 and w >= 20:
+        mask_4d = segutils.downsample_mask(mask_base, h, w).unsqueeze(1).float()  # [b, 1, h, w]
+        grid_area = F.adaptive_avg_pool2d(mask_4d, (2, 2))                        # [b, 1, 2, 2]
+        valid_zones = (grid_area > 0.15).float().squeeze(1).view(b, 4)            # Chỉ xét ô có >= 15% diện tích FG
 
         local_fg_o = (F.adaptive_avg_pool2d(base * mask_4d, (2, 2)) / (grid_area + 1e-6)).view(b, c, 4)
         local_fg_t = (F.adaptive_avg_pool2d(transformed * mask_4d, (2, 2)) / (grid_area + 1e-6)).view(b, c, 4)
 
-        local_sim = F.cosine_similarity(local_fg_o, local_fg_t, dim=1)  # [b, 4]
+        local_sim = F.cosine_similarity(local_fg_o, local_fg_t, dim=1)            # [b, 4]
         loss_local = ((1.0 - local_sim) * valid_zones).sum() / (valid_zones.sum() + 1e-6)
     else:
         loss_local = 0.0
 
-    return loss_global + 0.3 * loss_local
+    return loss_fg + 0.2 * loss_bg + 0.25 * loss_local
 
 # -------------------hàm Lp ban đầu------------
 # features of base, transformed: [b,c,h,w]
@@ -538,7 +513,7 @@ class ContrastiveFeatureTransformer(nn.Module):
             # Aggregate loss
             # loss = qloss + sloss + q_s_loss_diff + proto_loss
 
-            loss = qloss + sloss + q_s_loss_diff + (1 * proto_loss) # loss giúp tăng cho lung
+            loss = qloss + sloss + q_s_loss_diff + (1.5 * proto_loss) # loss giúp tăng cho lung
             
             assert loss.isfinite().all(), f"invalid contrastive loss:{loss}"
 
