@@ -22,3 +22,5 @@ __pycache__/
 *.pyc
 
 docs/ABCDFSS.md
+
+datasets/datasets/
