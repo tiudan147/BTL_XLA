@@ -166,11 +166,11 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     b, c, h, w = base.shape
     assert b == k * aug, 'provide correct k and aug such that dim0=k*aug'
 
-    # 1. Global Prototypes (Nền tảng neo giữ)
+    # 1. Global Prototypes (Giữ nền tảng ổn định)
     fg_proto_o, bg_proto_o = augwise_proto(base, mask_base, k, aug)
     fg_proto_t, bg_proto_t = augwise_proto(transformed, mask_transformed, k, aug)
 
-    # 2. Global InfoNCE (Symmetric - Duy trì bức tranh toàn cảnh)
+    # 2. Global InfoNCE (Symmetric)
     pos_fg = torch.exp(ssim(fg_proto_o, fg_proto_t) / tau_p)
     neg_bg_o = 0.5 * (torch.exp(ssim(fg_proto_o, bg_proto_t) / tau_p) + torch.exp(ssim(fg_proto_o, bg_proto_o) / tau_p))
     neg_bg_t = 0.5 * (torch.exp(ssim(fg_proto_t, bg_proto_o) / tau_p) + torch.exp(ssim(fg_proto_t, bg_proto_t) / tau_p))
@@ -181,23 +181,32 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     loss_global_bg = -torch.log(pos_bg / (pos_bg + neg_bg_cross)).mean()
 
     # ==========================================
-    # 3. ĐỘT PHÁ V14: DENSE PIXEL-LEVEL INFONCE
-    # (Tự động thích ứng, triệt tiêu nhãn nhiễu bằng LogSumExp)
+    # 3. ĐỘT PHÁ V15: Confidence-Gated Dense InfoNCE
     # ==========================================
-    
     soft_mask = segutils.downsample_mask(mask_base, h, w).unsqueeze(1) # [b, 1, h, w]
     bg_mask = torch.clamp(1.0 - soft_mask, min=0.0, max=1.0)
     
     base_norm = F.normalize(base, p=2, dim=1)
     trans_norm = F.normalize(transformed, p=2, dim=1)
-    
-    # A. Tìm Hard Background (Vùng nền dễ gây nhầm lẫn nhất)
-    tau_hard = 0.25
+
+    # --- A. Cổng Tự Tin (Confidence Gate - Sức mạnh của V12) ---
     fg_o_unsq = F.normalize(fg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
+    bg_o_unsq = F.normalize(bg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
+    
+    sim_to_fg = (base_norm * fg_o_unsq).sum(dim=1, keepdim=True)
+    sim_to_bg = (base_norm * bg_o_unsq).sum(dim=1, keepdim=True)
+    
+    tau_conf = 0.2
+    conf_weight = torch.exp(sim_to_fg / tau_conf) / (torch.exp(sim_to_fg / tau_conf) + torch.exp(sim_to_bg / tau_conf) + 1e-6)
+    
+    # Lọc rác tự động, mài mềm viền cho ISIC/SUIM
+    effective_mask = soft_mask * conf_weight 
+
+    # --- B. Trích xuất Hard BG (Vũ khí tối thượng của V14) ---
+    tau_hard = 0.25
     fg_t_unsq = F.normalize(fg_proto_t, p=2, dim=-1).view(b, c, 1, 1).detach()
     
-    sim_bg_fg_o = (base_norm * fg_o_unsq).sum(dim=1, keepdim=True)
-    logits_bg_o = (sim_bg_fg_o / tau_hard).masked_fill(bg_mask < 0.1, -1e4)
+    logits_bg_o = (sim_to_fg / tau_hard).masked_fill(bg_mask < 0.1, -1e4)
     weights_bg_o = F.softmax(logits_bg_o.view(b, -1), dim=-1).view(b, 1, h, w) * bg_mask
     bg_hard_o = (base * weights_bg_o).sum(dim=(2,3)) / (weights_bg_o.sum(dim=(2,3)) + 1e-6)
     bg_hard_o = F.normalize(bg_hard_o, p=2, dim=1).view(b, c, 1, 1)
@@ -207,15 +216,12 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     weights_bg_t = F.softmax(logits_bg_t.view(b, -1), dim=-1).view(b, 1, h, w) * bg_mask
     bg_hard_t = (transformed * weights_bg_t).sum(dim=(2,3)) / (weights_bg_t.sum(dim=(2,3)) + 1e-6)
     bg_hard_t = F.normalize(bg_hard_t, p=2, dim=1).view(b, c, 1, 1)
-    
-    # B. Xây dựng Dense InfoNCE (Tự động triệt tiêu rác)
+
+    # --- C. Dense InfoNCE (LogSumExp) ---
     tau_dense = 0.15
     
-    # Positive (Tử số): Khớp pixel gốc với chính nó sau biến đổi
-    pos_dense = (base_norm * trans_norm).sum(dim=1, keepdim=True) / tau_dense # [b, 1, h, w]
+    pos_dense = (base_norm * trans_norm).sum(dim=1, keepdim=True) / tau_dense
     
-    # Negatives (Mẫu số): Đẩy pixel ra xa Global BG và Hard BG
-    bg_o_unsq = F.normalize(bg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
     bg_t_unsq = F.normalize(bg_proto_t, p=2, dim=-1).view(b, c, 1, 1).detach()
     
     neg_bg_o = (base_norm * bg_o_unsq).sum(dim=1, keepdim=True) / tau_dense
@@ -223,18 +229,16 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     neg_hard_o = (base_norm * bg_hard_o).sum(dim=1, keepdim=True) / tau_dense
     neg_hard_t = (base_norm * bg_hard_t).sum(dim=1, keepdim=True) / tau_dense
     
-    # Tính LogSumExp: Công thức InfoNCE gốc rễ
     all_logits = torch.stack([pos_dense, neg_bg_o, neg_bg_t, neg_hard_o, neg_hard_t], dim=-1)
     lse_all = torch.logsumexp(all_logits, dim=-1) # [b, 1, h, w]
     
-    # Loss = LogSumExp(tất cả) - Positive = -log( exp(pos) / sum(exp(all)) )
     loss_dense_map = lse_all - pos_dense 
     
-    # Chỉ tính Loss trung bình trên các pixel thuộc Tiền cảnh
-    loss_dense = (loss_dense_map * soft_mask).sum() / (soft_mask.sum() + 1e-6)
+    # CHỈ áp dụng Dense InfoNCE đi qua màng lọc Tự tin
+    loss_dense = (loss_dense_map * effective_mask).sum() / (effective_mask.sum() + 1e-6)
 
-    # Tỷ lệ tổng hợp: 1.0 (Global FG) - 0.2 (Global BG) - 0.4 (Dense InfoNCE)
-    return loss_global_fg + 0.2 * loss_global_bg + 0.4 * loss_dense
+    # Tỷ lệ: 1.0 (Global FG) - 0.2 (Global BG) - 0.5 (Gated Dense InfoNCE)
+    return loss_global_fg + 0.2 * loss_global_bg + 0.5 * loss_dense
 
 # -------------------hàm Lp ban đầu------------
 # features of base, transformed: [b,c,h,w]
