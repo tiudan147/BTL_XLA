@@ -165,6 +165,10 @@ def self_attention_loss(f_base, f_transformed, mask_base, mask_transformed, k, a
 #            Nơi định nghĩa hàm loss Lp (Bản Tối Giản Tuyệt Đối V35)
 #------------------------------------------------
 
+#------------------------------------------------
+#            Nơi định nghĩa hàm loss Lp (Kiến trúc Đột phá TF-MiP2P)
+#------------------------------------------------
+
 def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, aug, tau_p=0.5):
     assert transformed.shape == base.shape, ".."
     b, c, h, w = base.shape
@@ -219,6 +223,46 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
 
     # Đích đến (Target) cho Cross Entropy luôn là Index 0 trong ma trận cắt
     targets = torch.zeros((b, h, w), dtype=torch.long, device=base.device)
+
+    # ==========================================
+    # 3. KERNELIZED MARGIN CROSS-ENTROPY (Giải phóng CPU/GPU)
+    # Không còn logsumexp, không còn manual math!
+    # ==========================================
+    
+    # --- A. CĂN CHỈNH TIỀN CẢNH (Cắt lát ma trận: lấy index 0,1,2) ---
+    logits_fg_o = sims_o[:, :3].clone()
+    logits_fg_o[:, 0] -= m_pos      # Target 
+    logits_fg_o[:, 1:] += m_neg     # Negatives
+    logits_fg_o /= tau_dense
+    loss_fg_map_o = F.cross_entropy(logits_fg_o, targets, reduction='none')
+
+    logits_fg_t = sims_t[:, :3].clone()
+    logits_fg_t[:, 0] -= m_pos
+    logits_fg_t[:, 1:] += m_neg
+    logits_fg_t /= tau_dense
+    loss_fg_map_t = F.cross_entropy(logits_fg_t, targets, reduction='none')
+
+    loss_dense_fg = 0.5 * ((loss_fg_map_o * soft_mask_o).sum() / (soft_mask_o.sum() + 1e-6) +
+                           (loss_fg_map_t * soft_mask_t).sum() / (soft_mask_t.sum() + 1e-6))
+
+    # --- B. CĂN CHỈNH HẬU CẢNH (Cắt lát ma trận: lấy index 2,3,0) ---
+    logits_bg_o = sims_o[:, [2, 3, 0]].clone()
+    logits_bg_o[:, 0] -= m_pos
+    logits_bg_o[:, 1:] += m_neg
+    logits_bg_o /= tau_dense
+    loss_bg_map_o = F.cross_entropy(logits_bg_o, targets, reduction='none')
+
+    logits_bg_t = sims_t[:, [2, 3, 0]].clone()
+    logits_bg_t[:, 0] -= m_pos
+    logits_bg_t[:, 1:] += m_neg
+    logits_bg_t /= tau_dense
+    loss_bg_map_t = F.cross_entropy(logits_bg_t, targets, reduction='none')
+
+    loss_dense_bg = 0.5 * ((loss_bg_map_o * bg_mask_o).sum() / (bg_mask_o.sum() + 1e-6) +
+                           (loss_bg_map_t * bg_mask_t).sum() / (bg_mask_t.sum() + 1e-6))
+
+    # Tỷ lệ tổng hợp
+    return loss_global_fg + 0.5 * loss_ortho + 0.5 * loss_dense_fg + 0.2 * loss_dense_bg
 
     # ==========================================
     # 3. KERNELIZED MARGIN CROSS-ENTROPY (Giải phóng CPU/GPU)
