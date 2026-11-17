@@ -166,100 +166,79 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     b, c, h, w = base.shape
     assert b == k * aug, 'provide correct k and aug such that dim0=k*aug'
 
-    # ==========================================
-    # 1. GLOBAL PROTOTYPE INFONCE (Neo giữ ngữ nghĩa vĩ mô)
-    # ==========================================
+    # 1. TÍNH TOÁN PROTOTYPE TOÀN CỤC (Mỏ neo siêu chống nhiễu)
     fg_proto_o, bg_proto_o = augwise_proto(base, mask_base, k, aug)
     fg_proto_t, bg_proto_t = augwise_proto(transformed, mask_transformed, k, aug)
 
+    # 2. GLOBAL LOSS (Duy trì bức tranh tổng thể như bài báo gốc)
     pos_fg = torch.exp(ssim(fg_proto_o, fg_proto_t) / tau_p)
     neg_bg_o = 0.5 * (torch.exp(ssim(fg_proto_o, bg_proto_t) / tau_p) + torch.exp(ssim(fg_proto_o, bg_proto_o) / tau_p))
     neg_bg_t = 0.5 * (torch.exp(ssim(fg_proto_t, bg_proto_o) / tau_p) + torch.exp(ssim(fg_proto_t, bg_proto_t) / tau_p))
     loss_global_fg = 0.5 * (-torch.log(pos_fg / (pos_fg + neg_bg_o)) - torch.log(pos_fg / (pos_fg + neg_bg_t))).mean()
 
-    # ==========================================
-    # 2. ĐỘT PHÁ V19: SELF-ATTENTION DICE LOSS (SADL)
-    # Mô phỏng chính xác thuật toán suy luận Test-time
-    # ==========================================
-    
-    # Chuẩn hóa đặc trưng
-    base_norm = F.normalize(base, p=2, dim=1)        # Đóng vai trò Support (Key)
-    trans_norm = F.normalize(transformed, p=2, dim=1) # Đóng vai trò Query (Query)
-    
-    # Ép phẳng không gian (Flatten)
-    Q = trans_norm.view(b, c, -1).transpose(1, 2) # [b, h*w, c]
-    K = base_norm.view(b, c, -1)                  # [b, c, h*w]
-    
-    # Ma trận tương quan Cross-Attention
-    # Chia cho căn bậc 2 của C để chống bùng nổ phân phối (chuẩn Transformer)
-    affinity = torch.bmm(Q, K) / (c ** 0.5)       # [b, h*w, h*w]
-    attn_weights = F.softmax(affinity, dim=-1)    # [b, h*w, h*w]
-    
-    # Downsample mặt nạ (Labels)
-    m_s = segutils.downsample_mask(mask_base, h, w).view(b, h*w, 1).float()       # Value (V)
-    m_q_gt = segutils.downsample_mask(mask_transformed, h, w).view(b, h*w).float() # Ground Truth Query
-    
-    # Dự đoán mặt nạ (Pseudo-Query Mask Prediction)
-    q_pred = torch.bmm(attn_weights, m_s).squeeze(-1) # [b, h*w]
-    
-    # Tính DICE LOSS (Tối ưu trực tiếp IoU, miễn nhiễm với nhãn nhiễu)
-    intersection = (q_pred * m_q_gt).sum(dim=1)
-    union = q_pred.sum(dim=1) + m_q_gt.sum(dim=1)
-    
-    # Thêm 1e-6 để tránh lỗi chia cho 0
-    dice_score = (2.0 * intersection + 1e-6) / (union + 1e-6)
-    loss_dice = (1.0 - dice_score).mean()
-
-    # Tỷ lệ tổng hợp: 1.0 (Global FG) + 0.5 (Self-Attention Dice)
-    return loss_global_fg + 0.5 * loss_dice
+    pos_bg = torch.exp(ssim(bg_proto_o, bg_proto_t) / tau_p)
+    neg_bg_cross = 0.5 * (torch.exp(ssim(bg_proto_o, fg_proto_t) / tau_p) + torch.exp(ssim(bg_proto_t, fg_proto_o) / tau_p))
+    loss_global_bg = -torch.log(pos_bg / (pos_bg + neg_bg_cross)).mean()
 
     # ==========================================
-    # 3. LOCAL LEVEL (Dense InfoNCE) - "Lưỡi cưa" của Lung/ISIC/SUIM
+    # 3. ĐỘT PHÁ V20: PIXEL-TO-PROTOTYPE (BP2P)
+    # Không cần chia lưới, không cắt ngưỡng, thuần túy toán học
     # ==========================================
     
-    # CHIẾN THUẬT V18: Scale-Aware Masking (Bảo vệ tuyệt đối vật thể nhỏ như SUIM)
-    fg_area = mask_4d.sum(dim=(2,3), keepdim=True)
-    # Nếu diện tích FG < 25 pixels, không gọt biên. Ngược lại, gọt 0.1 để mài sắc.
-    soft_mask = torch.where(fg_area < 25, mask_4d, mask_4d * torch.clamp(mask_4d - 0.1, min=0.0))
-    
-    # Strict Hard BG: Chỉ lấy Hard BG ở vùng hoàn toàn là nền (mask < 0.5) để né rác ranh giới
-    strict_bg_mask = (mask_4d < 0.5).float()
-    tau_hard = 0.25
-    
-    fg_t_unsq = F.normalize(fg_proto_t, p=2, dim=-1).view(b, c, 1, 1).detach()
-    sim_bg_fg_t = (base_norm * fg_t_unsq).sum(dim=1, keepdim=True)
-    logits_bg_t = (sim_bg_fg_t / tau_hard).masked_fill(strict_bg_mask == 0, -1e4)
-    weights_bg_t = F.softmax(logits_bg_t.view(b, -1), dim=-1).view(b, 1, h, w) * strict_bg_mask
-    bg_hard_t = F.normalize((base * weights_bg_t).sum(dim=(2,3)), p=2, dim=1).view(b, c, 1, 1)
+    tau_dense = 0.2
+    base_norm = F.normalize(base, p=2, dim=1)
+    trans_norm = F.normalize(transformed, p=2, dim=1)
 
-    fg_o_unsq = F.normalize(fg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
-    sim_bg_fg_o = (trans_norm * fg_o_unsq).sum(dim=1, keepdim=True)
-    logits_bg_o = (sim_bg_fg_o / tau_hard).masked_fill(strict_bg_mask == 0, -1e4)
-    weights_bg_o = F.softmax(logits_bg_o.view(b, -1), dim=-1).view(b, 1, h, w) * strict_bg_mask
-    bg_hard_o = F.normalize((transformed * weights_bg_o).sum(dim=(2,3)), p=2, dim=1).view(b, c, 1, 1)
+    # Đóng băng Mỏ neo (Trạm hải đăng tĩnh)
+    fg_p_o_stat = F.normalize(fg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
+    bg_p_o_stat = F.normalize(bg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
+    fg_p_t_stat = F.normalize(fg_proto_t, p=2, dim=-1).view(b, c, 1, 1).detach()
+    bg_p_t_stat = F.normalize(bg_proto_t, p=2, dim=-1).view(b, c, 1, 1).detach()
 
-    # InfoNCE Dày đặc
-    tau_dense = 0.15
-    pos_dense = (base_norm * trans_norm).sum(dim=1, keepdim=True) / tau_dense
-    
-    bg_o_unsq2 = F.normalize(bg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
-    bg_t_unsq2 = F.normalize(bg_proto_t, p=2, dim=-1).view(b, c, 1, 1).detach()
-    
-    neg_bg_o_dense = (base_norm * bg_o_unsq2).sum(dim=1, keepdim=True) / tau_dense
-    neg_bg_t_dense = (base_norm * bg_t_unsq2).sum(dim=1, keepdim=True) / tau_dense
-    neg_hard_o_dense = (base_norm * bg_hard_o).sum(dim=1, keepdim=True) / tau_dense
-    neg_hard_t_dense = (base_norm * bg_hard_t).sum(dim=1, keepdim=True) / tau_dense
-    
-    all_logits = torch.stack([pos_dense, neg_bg_o_dense, neg_bg_t_dense, neg_hard_o_dense, neg_hard_t_dense], dim=-1)
-    lse_all = torch.logsumexp(all_logits, dim=-1)
-    
-    loss_dense_map = lse_all - pos_dense 
-    
-    # Áp dụng soft_mask thông minh
-    loss_dense = (loss_dense_map * soft_mask).sum() / (soft_mask.sum() + 1e-6)
+    soft_mask_o = segutils.downsample_mask(mask_base, h, w).unsqueeze(1)
+    soft_mask_t = segutils.downsample_mask(mask_transformed, h, w).unsqueeze(1)
 
-    # Tỷ lệ: 1.0 Global FG + 0.2 Global BG + 0.3 Grid (Giữ Deepglobe) + 0.35 Dense (Đẩy ISIC/SUIM)
-    return loss_global_fg + 0.2 * loss_global_bg + 0.3 * loss_grid + 0.35 * loss_dense
+    # --- A. CĂN CHỈNH TỪNG PIXEL TIỀN CẢNH (Mài sắc ranh giới FG) ---
+    # Ảnh gốc
+    pos_fg_o_dense = (base_norm * fg_p_t_stat).sum(dim=1, keepdim=True) / tau_dense
+    neg_fg_o_1 = (base_norm * bg_p_t_stat).sum(dim=1, keepdim=True) / tau_dense
+    neg_fg_o_2 = (base_norm * bg_p_o_stat).sum(dim=1, keepdim=True) / tau_dense
+    lse_fg_o = torch.logsumexp(torch.stack([pos_fg_o_dense, neg_fg_o_1, neg_fg_o_2], dim=-1), dim=-1)
+    loss_fg_map_o = lse_fg_o - pos_fg_o_dense
+
+    # Ảnh biến đổi
+    pos_fg_t_dense = (trans_norm * fg_p_o_stat).sum(dim=1, keepdim=True) / tau_dense
+    neg_fg_t_1 = (trans_norm * bg_p_o_stat).sum(dim=1, keepdim=True) / tau_dense
+    neg_fg_t_2 = (trans_norm * bg_p_t_stat).sum(dim=1, keepdim=True) / tau_dense
+    lse_fg_t = torch.logsumexp(torch.stack([pos_fg_t_dense, neg_fg_t_1, neg_fg_t_2], dim=-1), dim=-1)
+    loss_fg_map_t = lse_fg_t - pos_fg_t_dense
+
+    loss_dense_fg = 0.5 * ((loss_fg_map_o * soft_mask_o).sum() / (soft_mask_o.sum() + 1e-6) +
+                           (loss_fg_map_t * soft_mask_t).sum() / (soft_mask_t.sum() + 1e-6))
+
+    # --- B. CĂN CHỈNH TỪNG PIXEL HẬU CẢNH (Đóng gói không gian BG) ---
+    bg_mask_o = torch.clamp(1.0 - soft_mask_o, min=0.0, max=1.0)
+    bg_mask_t = torch.clamp(1.0 - soft_mask_t, min=0.0, max=1.0)
+
+    # Ảnh gốc
+    pos_bg_o_dense = (base_norm * bg_p_t_stat).sum(dim=1, keepdim=True) / tau_dense
+    neg_bg_o_1 = (base_norm * fg_p_t_stat).sum(dim=1, keepdim=True) / tau_dense
+    neg_bg_o_2 = (base_norm * fg_p_o_stat).sum(dim=1, keepdim=True) / tau_dense
+    lse_bg_o = torch.logsumexp(torch.stack([pos_bg_o_dense, neg_bg_o_1, neg_bg_o_2], dim=-1), dim=-1)
+    loss_bg_map_o = lse_bg_o - pos_bg_o_dense
+
+    # Ảnh biến đổi
+    pos_bg_t_dense = (trans_norm * bg_p_o_stat).sum(dim=1, keepdim=True) / tau_dense
+    neg_bg_t_1 = (trans_norm * fg_p_o_stat).sum(dim=1, keepdim=True) / tau_dense
+    neg_bg_t_2 = (trans_norm * fg_p_t_stat).sum(dim=1, keepdim=True) / tau_dense
+    lse_bg_t = torch.logsumexp(torch.stack([pos_bg_t_dense, neg_bg_t_1, neg_bg_t_2], dim=-1), dim=-1)
+    loss_bg_map_t = lse_bg_t - pos_bg_t_dense
+
+    loss_dense_bg = 0.5 * ((loss_bg_map_o * bg_mask_o).sum() / (bg_mask_o.sum() + 1e-6) +
+                           (loss_bg_map_t * bg_mask_t).sum() / (bg_mask_t.sum() + 1e-6))
+
+    # Tỷ lệ tổng hợp
+    return loss_global_fg + 0.2 * loss_global_bg + 0.5 * loss_dense_fg + 0.2 * loss_dense_bg
 
 # -------------------hàm Lp ban đầu------------
 # features of base, transformed: [b,c,h,w]
