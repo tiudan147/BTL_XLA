@@ -303,40 +303,77 @@ class EnhancedAdaptationLoss(nn.Module):
 
 
 #---------------------------LFC------------------------
-
 class LCFAttention(nn.Module):
     def __init__(self, channels=64):
         super(LCFAttention, self).__init__()
         
-        # 1. Depthwise 3x3: Chiều chuộng Lung/ISIC (Lấy hình khối, không làm mờ chéo)
+        # 1. Depthwise 3x3
         self.dw_conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False)
-        
-        # 2. LayerNorm: Chiều chuộng Few-Shot (Miễn nhiễm hoàn toàn với Batch Size = 1)
         self.norm = nn.LayerNorm(channels, eps=1e-6)
         
-        # 3. ECA Conv1D: Chiều chuộng Deepglobe (Đánh trọng số kênh không cần nén)
+        # 2. ECA Channel Attention
         self.eca_pool = nn.AdaptiveAvgPool2d(1)
         self.eca_conv = nn.Conv1d(1, 1, kernel_size=3, padding=1, bias=False)
         self.sigmoid = nn.Sigmoid()
-
+        # 3. Phép gộp cục bộ để trích xuất tần số cao (High-Pass / Unsharp Masking)
+        self.avg_pool = nn.AvgPool2d(kernel_size=3, stride=1, padding=1)
+        # 4. Hệ số cổng học được, khởi tạo nhỏ bằng 0.1
+        self.gamma = nn.Parameter(torch.tensor(0.1))
     def forward(self, x):
         identity = x
         
-        # Bước 1: Trích xuất không gian lân cận
-        out = self.dw_conv(x)
+        # Trích xuất chi tiết tần số cao: X - AvgPool(X)
+        high_freq = x - self.avg_pool(x)
         
-        # Bước 2: Chuẩn hóa cực kỳ ổn định bằng LayerNorm
-        out = out.permute(0, 2, 3, 1) # Đảo chiều B, C, H, W -> B, H, W, C
+        # Trích xuất không gian lân cận + cộng chi tiết tần số cao
+        out = self.dw_conv(x) + high_freq
+        
+        # Chuẩn hóa LayerNorm
+        out = out.permute(0, 2, 3, 1)
         out = self.norm(out)
-        out = out.permute(0, 3, 1, 2) # Đảo lại B, C, H, W
+        out = out.permute(0, 3, 1, 2)
         
-        # Bước 3: Trích xuất trọng số Kênh (ECA)
-        v = self.eca_pool(out).squeeze(-1).transpose(-1, -2) # [B, 1, C]
+        # Trọng số kênh ECA
+        v = self.eca_pool(out).squeeze(-1).transpose(-1, -2)
         v = self.eca_conv(v)
-        v = v.transpose(-1, -2).unsqueeze(-1) # [B, C, 1, 1]
+        v = v.transpose(-1, -2).unsqueeze(-1)
         
-        # Bước 4: Trộn trọng số và Cộng Residual giữ độ nét
-        return identity + (out * self.sigmoid(v))
+        # Kết hợp qua hệ số cổng gamma: identity + gamma * (out * attention)
+        return identity + self.gamma * (out * self.sigmoid(v))
+
+# class LCFAttention(nn.Module):
+#     def __init__(self, channels=64):
+#         super(LCFAttention, self).__init__()
+        
+#         # 1. Depthwise 3x3: Chiều chuộng Lung/ISIC (Lấy hình khối, không làm mờ chéo)
+#         self.dw_conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False)
+        
+#         # 2. LayerNorm: Chiều chuộng Few-Shot (Miễn nhiễm hoàn toàn với Batch Size = 1)
+#         self.norm = nn.LayerNorm(channels, eps=1e-6)
+        
+#         # 3. ECA Conv1D: Chiều chuộng Deepglobe (Đánh trọng số kênh không cần nén)
+#         self.eca_pool = nn.AdaptiveAvgPool2d(1)
+#         self.eca_conv = nn.Conv1d(1, 1, kernel_size=3, padding=1, bias=False)
+#         self.sigmoid = nn.Sigmoid()
+
+#     def forward(self, x):
+#         identity = x
+        
+#         # Bước 1: Trích xuất không gian lân cận
+#         out = self.dw_conv(x)
+        
+#         # Bước 2: Chuẩn hóa cực kỳ ổn định bằng LayerNorm
+#         out = out.permute(0, 2, 3, 1) # Đảo chiều B, C, H, W -> B, H, W, C
+#         out = self.norm(out)
+#         out = out.permute(0, 3, 1, 2) # Đảo lại B, C, H, W
+        
+#         # Bước 3: Trích xuất trọng số Kênh (ECA)
+#         v = self.eca_pool(out).squeeze(-1).transpose(-1, -2) # [B, 1, C]
+#         v = self.eca_conv(v)
+#         v = v.transpose(-1, -2).unsqueeze(-1) # [B, C, 1, 1]
+        
+#         # Bước 4: Trộn trọng số và Cộng Residual giữ độ nét
+#         return identity + (out * self.sigmoid(v))
 
 
 class ContrastiveFeatureTransformer(nn.Module):
