@@ -182,8 +182,12 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     loss_global_bg = -torch.log(pos_bg / (pos_bg + neg_bg_cross)).mean()
 
     # ==========================================
-    # 2. DYNAMIC TEMPERATURE & MARGIN P2P (DTAM-P2P)
+    # 2. SHANNON ENTROPY-GUIDED P2P (Bảo vệ không gian bằng Lý thuyết Thông tin)
     # ==========================================
+    tau_dense = 0.2
+    m_pos = 0.15  # Trả lại Margin cố định siêu ổn định của V21
+    m_neg = 0.05 
+    
     base_norm = F.normalize(base, p=2, dim=1)
     trans_norm = F.normalize(transformed, p=2, dim=1)
 
@@ -194,44 +198,65 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
 
     soft_mask_o = segutils.downsample_mask(mask_base, h, w).unsqueeze(1)
     soft_mask_t = segutils.downsample_mask(mask_transformed, h, w).unsqueeze(1)
+
+    # --- HÀM TÍNH TRỌNG SỐ ENTROPY (Shannon Information) ---
+    def get_certainty_weight(feats, p_fg, p_bg):
+        # Tính tương đồng Cosine
+        sim_fg = (feats * p_fg).sum(dim=1, keepdim=True)
+        sim_bg = (feats * p_bg).sum(dim=1, keepdim=True)
+        
+        # Chuyển thành phân bố xác suất (Dùng tau nhỏ để tính entropy cho nhạy)
+        logits = torch.cat([sim_fg, sim_bg], dim=1) / 0.1
+        probs = F.softmax(logits, dim=1)
+        
+        # Tính Shannon Entropy: H = - sum(P * log(P))
+        entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=1, keepdim=True)
+        
+        # Chuẩn hóa về [0, 1] (Entropy max của 2 lớp là ln(2) ~ 0.6931)
+        # Giữ lại `.detach()` để chặn gradient, chỉ coi đây là một hệ số (weight) tĩnh
+        certainty = torch.clamp(1.0 - (entropy / 0.6931), min=0.0, max=1.0).detach()
+        return certainty
+
+    # Tính Trọng số Tự tin bằng Trí thông minh nội tại
+    certainty_o = get_certainty_weight(base_norm, fg_p_t, bg_p_t)
+    certainty_t = get_certainty_weight(trans_norm, fg_p_o, bg_p_o)
+
+    # Lồng ghép vào Mask để lọc rác mềm mại
+    eff_mask_fg_o = soft_mask_o * certainty_o
+    eff_mask_fg_t = soft_mask_t * certainty_t
+    
     bg_mask_o = torch.clamp(1.0 - soft_mask_o, min=0.0, max=1.0)
     bg_mask_t = torch.clamp(1.0 - soft_mask_t, min=0.0, max=1.0)
+    eff_mask_bg_o = bg_mask_o * certainty_o
+    eff_mask_bg_t = bg_mask_t * certainty_t
 
-    # --- HÀM TÍNH LOSS VỚI NHIỆT ĐỘ & MARGIN ĐỘNG ---
-    def dtam_p2p_loss(feats, p_pos, p_neg1, p_neg2, mask):
-        sim_pos = (feats * p_pos).sum(dim=1, keepdim=True)
-        sim_neg1 = (feats * p_neg1).sum(dim=1, keepdim=True)
+    # --- A. CĂN CHỈNH TỪNG PIXEL TIỀN CẢNH (Cấu trúc V21 bất khả chiến bại) ---
+    pos_fg_o = ((base_norm * fg_p_t).sum(dim=1, keepdim=True) - m_pos) / tau_dense
+    neg_fg_o_1 = ((base_norm * bg_p_t).sum(dim=1, keepdim=True) + m_neg) / tau_dense
+    neg_fg_o_2 = ((base_norm * bg_p_o).sum(dim=1, keepdim=True) + m_neg) / tau_dense
+    loss_fg_map_o = torch.logsumexp(torch.stack([pos_fg_o, neg_fg_o_1, neg_fg_o_2], dim=-1), dim=-1) - pos_fg_o
 
-        # Tính độ chênh lệch (Confidence Diff), giới hạn tối đa 1.0
-        diff = torch.clamp(sim_pos.detach() - sim_neg1.detach(), min=0.0, max=1.0)
-        
-        # 1. Dynamic Margin (Kế thừa sức mạnh V30)
-        m_pos_dyn = 0.20 * diff
-        m_neg_dyn = 0.10 * diff
+    pos_fg_t = ((trans_norm * fg_p_o).sum(dim=1, keepdim=True) - m_pos) / tau_dense
+    neg_fg_t_1 = ((trans_norm * bg_p_o).sum(dim=1, keepdim=True) + m_neg) / tau_dense
+    neg_fg_t_2 = ((trans_norm * bg_p_t).sum(dim=1, keepdim=True) + m_neg) / tau_dense
+    loss_fg_map_t = torch.logsumexp(torch.stack([pos_fg_t, neg_fg_t_1, neg_fg_t_2], dim=-1), dim=-1) - pos_fg_t
 
-        # 2. ĐỘT PHÁ V31: Dynamic Temperature
-        # Nếu tự tin cao (diff ~ 1) -> tau ~ 0.1 (Rất sắc nét cho Lung)
-        # Nếu tự tin thấp (diff ~ 0) -> tau ~ 0.3 (Mềm mỏng, chặn rác cho Deepglobe)
-        tau_dyn = 0.1 + 0.2 * (1.0 - diff)
-
-        # InfoNCE có kiểm soát kép
-        pos_logit = (sim_pos - m_pos_dyn) / tau_dyn
-        neg_logit_1 = (sim_neg1 + m_neg_dyn) / tau_dyn
-        neg_logit_2 = ((feats * p_neg2).sum(dim=1, keepdim=True) + m_neg_dyn) / tau_dyn
-
-        lse = torch.logsumexp(torch.stack([pos_logit, neg_logit_1, neg_logit_2], dim=-1), dim=-1)
-        loss_map = lse - pos_logit
-        return (loss_map * mask).sum() / (mask.sum() + 1e-6)
-
-    # --- A. CĂN CHỈNH TỪNG PIXEL TIỀN CẢNH ---
-    loss_fg_o = dtam_p2p_loss(base_norm, fg_p_t, bg_p_t, bg_p_o, soft_mask_o)
-    loss_fg_t = dtam_p2p_loss(trans_norm, fg_p_o, bg_p_o, bg_p_t, soft_mask_t)
-    loss_dense_fg = 0.5 * (loss_fg_o + loss_fg_t)
+    loss_dense_fg = 0.5 * ((loss_fg_map_o * eff_mask_fg_o).sum() / (eff_mask_fg_o.sum() + 1e-6) +
+                           (loss_fg_map_t * eff_mask_fg_t).sum() / (eff_mask_fg_t.sum() + 1e-6))
 
     # --- B. CĂN CHỈNH TỪNG PIXEL HẬU CẢNH ---
-    loss_bg_o = dtam_p2p_loss(base_norm, bg_p_t, fg_p_t, fg_p_o, bg_mask_o)
-    loss_bg_t = dtam_p2p_loss(trans_norm, bg_p_o, fg_p_o, fg_p_t, bg_mask_t)
-    loss_dense_bg = 0.5 * (loss_bg_o + loss_bg_t)
+    pos_bg_o = ((base_norm * bg_p_t).sum(dim=1, keepdim=True) - m_pos) / tau_dense
+    neg_bg_o_1 = ((base_norm * fg_p_t).sum(dim=1, keepdim=True) + m_neg) / tau_dense
+    neg_bg_o_2 = ((base_norm * fg_p_o).sum(dim=1, keepdim=True) + m_neg) / tau_dense
+    loss_bg_map_o = torch.logsumexp(torch.stack([pos_bg_o, neg_bg_o_1, neg_bg_o_2], dim=-1), dim=-1) - pos_bg_o
+
+    pos_bg_t = ((trans_norm * bg_p_o).sum(dim=1, keepdim=True) - m_pos) / tau_dense
+    neg_bg_t_1 = ((trans_norm * fg_p_o).sum(dim=1, keepdim=True) + m_neg) / tau_dense
+    neg_bg_t_2 = ((trans_norm * fg_p_t).sum(dim=1, keepdim=True) + m_neg) / tau_dense
+    loss_bg_map_t = torch.logsumexp(torch.stack([pos_bg_t, neg_bg_t_1, neg_bg_t_2], dim=-1), dim=-1) - pos_bg_t
+
+    loss_dense_bg = 0.5 * ((loss_bg_map_o * eff_mask_bg_o).sum() / (eff_mask_bg_o.sum() + 1e-6) +
+                           (loss_bg_map_t * eff_mask_bg_t).sum() / (eff_mask_bg_t.sum() + 1e-6))
 
     # Tỷ lệ tổng hợp
     return loss_global_fg + 0.2 * loss_global_bg + 0.5 * loss_dense_fg + 0.2 * loss_dense_bg
