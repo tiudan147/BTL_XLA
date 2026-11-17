@@ -164,6 +164,7 @@ def self_attention_loss(f_base, f_transformed, mask_base, mask_transformed, k, a
 def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, aug, tau_p=0.5):
     assert transformed.shape == base.shape, ".."
     b, c, h, w = base.shape
+    hw = h * w
     assert b == k * aug, 'provide correct k and aug such that dim0=k*aug'
 
     # ==========================================
@@ -173,81 +174,71 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     fg_proto_t, bg_proto_t = augwise_proto(transformed, mask_transformed, k, aug)
 
     # ==========================================
-    # 2. GLOBAL INFONCE SỬA LỖI (Chuẩn hóa Softmax Mẫu số chung)
+    # 2. GLOBAL LOSS (Duy trì sự bất biến của Mỏ neo vĩ mô)
     # ==========================================
-    # Ảnh gốc làm mỏ neo
-    pos_fg_o = torch.exp(ssim(fg_proto_o, fg_proto_t) / tau_p)
-    neg_bg_intra_o = torch.exp(ssim(fg_proto_o, bg_proto_o) / tau_p)
-    neg_bg_cross_o = torch.exp(ssim(fg_proto_o, bg_proto_t) / tau_p)
-    loss_global_fg_o = -torch.log(pos_fg_o / (pos_fg_o + neg_bg_intra_o + neg_bg_cross_o)).mean()
+    pos_fg = torch.exp(ssim(fg_proto_o, fg_proto_t) / tau_p)
+    neg_bg_o = 0.5 * (torch.exp(ssim(fg_proto_o, bg_proto_t) / tau_p) + torch.exp(ssim(fg_proto_o, bg_proto_o) / tau_p))
+    neg_bg_t = 0.5 * (torch.exp(ssim(fg_proto_t, bg_proto_o) / tau_p) + torch.exp(ssim(fg_proto_t, bg_proto_t) / tau_p))
+    loss_global_fg = 0.5 * (-torch.log(pos_fg / (pos_fg + neg_bg_o)) - torch.log(pos_fg / (pos_fg + neg_bg_t))).mean()
 
-    # Ảnh biến đổi làm mỏ neo
-    pos_fg_t = torch.exp(ssim(fg_proto_t, fg_proto_o) / tau_p)
-    neg_bg_intra_t = torch.exp(ssim(fg_proto_t, bg_proto_t) / tau_p)
-    neg_bg_cross_t = torch.exp(ssim(fg_proto_t, bg_proto_o) / tau_p)
-    loss_global_fg_t = -torch.log(pos_fg_t / (pos_fg_t + neg_bg_intra_t + neg_bg_cross_t)).mean()
-
-    loss_global = 0.5 * (loss_global_fg_o + loss_global_fg_t)
+    # Trực giao vĩ mô: Ép 2 khái niệm FG và BG vuông góc tuyệt đối
+    loss_ortho = 0.5 * (F.relu(ssim(fg_proto_o, bg_proto_o)) + F.relu(ssim(fg_proto_t, bg_proto_t))).mean()
 
     # ==========================================
-    # 3. DECOUPLED ASYMMETRIC DENSE P2P (Khắc phục Scale Imbalance & Feature Drift)
+    # 3. SPATIAL DENSE CONTRASTIVE (Kiến trúc Hình học Toàn vẹn)
+    # KHÔNG dùng Hậu cảnh tập trung. Dùng Ma trận Tương quan Không gian.
     # ==========================================
     tau_dense = 0.2
+    m_pos = 0.15 
+    m_neg = 0.05 
     
-    # FG: Hội tụ khắt khe (Cross-view)
-    fg_m_pos = 0.15
-    fg_m_neg = 0.05
+    base_flat = F.normalize(base, p=2, dim=1).view(b, c, hw)         # [b, c, hw]
+    trans_flat = F.normalize(transformed, p=2, dim=1).view(b, c, hw) # [b, c, hw]
+
+    # Mỏ neo Tiền cảnh tĩnh
+    fg_p_o = F.normalize(fg_proto_o, p=2, dim=-1).view(b, c, 1).detach()
+    fg_p_t = F.normalize(fg_proto_t, p=2, dim=-1).view(b, c, 1).detach()
+
+    soft_mask_o = segutils.downsample_mask(mask_base, h, w).view(b, hw)
+    soft_mask_t = segutils.downsample_mask(mask_transformed, h, w).view(b, hw)
     
-    # BG: Co cụm lỏng lẻo cục bộ (Intra-view), Đẩy lùi kịch liệt FG
-    bg_m_pos = 0.05
-    bg_m_neg = 0.15
-
-    base_norm = F.normalize(base, p=2, dim=1)
-    trans_norm = F.normalize(transformed, p=2, dim=1)
-
-    # Đóng băng Mỏ neo
-    fg_p_o = F.normalize(fg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
-    bg_p_o = F.normalize(bg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
-    fg_p_t = F.normalize(fg_proto_t, p=2, dim=-1).view(b, c, 1, 1).detach()
-    bg_p_t = F.normalize(bg_proto_t, p=2, dim=-1).view(b, c, 1, 1).detach()
-
-    soft_mask_o = segutils.downsample_mask(mask_base, h, w).unsqueeze(1)
-    soft_mask_t = segutils.downsample_mask(mask_transformed, h, w).unsqueeze(1)
-    bg_mask_o = torch.clamp(1.0 - soft_mask_o, min=0.0, max=1.0)
     bg_mask_t = torch.clamp(1.0 - soft_mask_t, min=0.0, max=1.0)
+    bg_mask_o = torch.clamp(1.0 - soft_mask_o, min=0.0, max=1.0)
 
-    # --- A. PIXEL TIỀN CẢNH: KÉO CHÉO (CROSS-VIEW PULL) ---
-    # Mục tiêu dương là FG ảnh đối diện
-    pos_fg_o = ((base_norm * fg_p_t).sum(dim=1, keepdim=True) - fg_m_pos) / tau_dense
-    neg_fg_o_1 = ((base_norm * bg_p_t).sum(dim=1, keepdim=True) + fg_m_neg) / tau_dense
-    neg_fg_o_2 = ((base_norm * bg_p_o).sum(dim=1, keepdim=True) + fg_m_neg) / tau_dense
-    loss_fg_map_o = torch.logsumexp(torch.stack([pos_fg_o, neg_fg_o_1, neg_fg_o_2], dim=-1), dim=-1) - pos_fg_o
+    # --- A. CĂN CHỈNH PIXEL ẢNH GỐC (Bằng Lực kéo Đa chiều) ---
+    # Mục tiêu Positive: Kéo FG pixel về Mỏ neo FG duy nhất
+    sim_pos_o = torch.bmm(base_flat.transpose(1, 2), fg_p_t) # [b, hw, 1]
+    logit_pos_o = (sim_pos_o - m_pos) / tau_dense
 
-    pos_fg_t = ((trans_norm * fg_p_o).sum(dim=1, keepdim=True) - fg_m_pos) / tau_dense
-    neg_fg_t_1 = ((trans_norm * bg_p_o).sum(dim=1, keepdim=True) + fg_m_neg) / tau_dense
-    neg_fg_t_2 = ((trans_norm * bg_p_t).sum(dim=1, keepdim=True) + fg_m_neg) / tau_dense
-    loss_fg_map_t = torch.logsumexp(torch.stack([pos_fg_t, neg_fg_t_1, neg_fg_t_2], dim=-1), dim=-1) - pos_fg_t
+    # Mục tiêu Negative: Đẩy lùi FG pixel xa khỏi HÀNG NGHÌN pixel BG cụ thể 
+    sim_all_o = torch.bmm(base_flat.transpose(1, 2), trans_flat.detach()) # [b, hw, hw]
+    penalty_bg_t = (1.0 - bg_mask_t).unsqueeze(1) * 1e4 # [b, 1, hw] - Loại bỏ pixel rác/FG khỏi tập đẩy
+    logit_neg_o = (sim_all_o - penalty_bg_t + m_neg) / tau_dense # [b, hw, hw]
 
-    loss_dense_fg = 0.5 * ((loss_fg_map_o * soft_mask_o).sum() / (soft_mask_o.sum() + 1e-6) + 
-                           (loss_fg_map_t * soft_mask_t).sum() / (soft_mask_t.sum() + 1e-6))
+    # InfoNCE Tích hợp: 1 Điểm kéo, Hàng nghìn Điểm đẩy
+    logits_o = torch.cat([logit_pos_o, logit_neg_o], dim=2) # [b, hw, hw+1]
+    lse_o = torch.logsumexp(logits_o, dim=2, keepdim=True)
+    loss_map_o = (lse_o - logit_pos_o).squeeze(2) # [b, hw]
+    loss_dense_o = (loss_map_o * soft_mask_o).sum() / (soft_mask_o.sum() + 1e-6)
 
-    # --- B. PIXEL HẬU CẢNH: KÉO CỤC BỘ (INTRA-VIEW PULL) ---
-    # MỤC TIÊU DƯƠNG LÀ BG ẢNH CỦA CHÍNH NÓ (Bảo toàn Local Smoothness, Giải quyết Multi-modal)
-    pos_bg_o = ((base_norm * bg_p_o).sum(dim=1, keepdim=True) - bg_m_pos) / tau_dense
-    neg_bg_o_1 = ((base_norm * fg_p_o).sum(dim=1, keepdim=True) + bg_m_neg) / tau_dense
-    neg_bg_o_2 = ((base_norm * fg_p_t).sum(dim=1, keepdim=True) + bg_m_neg) / tau_dense
-    loss_bg_map_o = torch.logsumexp(torch.stack([pos_bg_o, neg_bg_o_1, neg_bg_o_2], dim=-1), dim=-1) - pos_bg_o
+    # --- B. CĂN CHỈNH PIXEL ẢNH BIẾN ĐỔI ---
+    sim_pos_t = torch.bmm(trans_flat.transpose(1, 2), fg_p_o) 
+    logit_pos_t = (sim_pos_t - m_pos) / tau_dense
 
-    pos_bg_t = ((trans_norm * bg_p_t).sum(dim=1, keepdim=True) - bg_m_pos) / tau_dense
-    neg_bg_t_1 = ((trans_norm * fg_p_t).sum(dim=1, keepdim=True) + bg_m_neg) / tau_dense
-    neg_bg_t_2 = ((trans_norm * fg_p_o).sum(dim=1, keepdim=True) + bg_m_neg) / tau_dense
-    loss_bg_map_t = torch.logsumexp(torch.stack([pos_bg_t, neg_bg_t_1, neg_bg_t_2], dim=-1), dim=-1) - pos_bg_t
+    sim_all_t = torch.bmm(trans_flat.transpose(1, 2), base_flat.detach()) 
+    penalty_bg_o = (1.0 - bg_mask_o).unsqueeze(1) * 1e4 
+    logit_neg_t = (sim_all_t - penalty_bg_o + m_neg) / tau_dense 
 
-    loss_dense_bg = 0.5 * ((loss_bg_map_o * bg_mask_o).sum() / (bg_mask_o.sum() + 1e-6) +
-                           (loss_bg_map_t * bg_mask_t).sum() / (bg_mask_t.sum() + 1e-6))
+    logits_t = torch.cat([logit_pos_t, logit_neg_t], dim=2)
+    lse_t = torch.logsumexp(logits_t, dim=2, keepdim=True)
+    loss_map_t = (lse_t - logit_pos_t).squeeze(2)
+    loss_dense_t = (loss_map_t * soft_mask_t).sum() / (soft_mask_t.sum() + 1e-6)
 
-    # Tỷ lệ tổng hợp: Trả lại trọng số cân bằng chuẩn mực
-    return loss_global + 1.0 * loss_dense_fg + 0.5 * loss_dense_bg
+    # GIẢI PHÓNG HẬU CẢNH: Không còn loss_dense_bg. Nền tự do, Gradient 100% dành cho gọt viền FG.
+    loss_dense_fg = 0.5 * (loss_dense_o + loss_dense_t)
+
+    # Trọng số tối ưu hóa
+    return loss_global_fg + 0.5 * loss_ortho + 1.0 * loss_dense_fg
 
 # -------------------hàm Lp ban đầu------------
 # features of base, transformed: [b,c,h,w]
