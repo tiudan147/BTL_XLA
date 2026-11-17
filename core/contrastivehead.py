@@ -170,17 +170,18 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     fg_proto_o, bg_proto_o = augwise_proto(base, mask_base, k, aug)
     fg_proto_t, bg_proto_t = augwise_proto(transformed, mask_transformed, k, aug)
 
-    # 2. GLOBAL FG CONSISTENCY (Chỉ kéo FG lại gần nhau, KHÔNG ép BG phải giống nhau)
+    # 2. GLOBAL LOSS (Duy trì cấu trúc vĩ mô)
     pos_fg = torch.exp(ssim(fg_proto_o, fg_proto_t) / tau_p)
     neg_bg_o = 0.5 * (torch.exp(ssim(fg_proto_o, bg_proto_t) / tau_p) + torch.exp(ssim(fg_proto_o, bg_proto_o) / tau_p))
     neg_bg_t = 0.5 * (torch.exp(ssim(fg_proto_t, bg_proto_o) / tau_p) + torch.exp(ssim(fg_proto_t, bg_proto_t) / tau_p))
     loss_global_fg = 0.5 * (-torch.log(pos_fg / (pos_fg + neg_bg_o)) - torch.log(pos_fg / (pos_fg + neg_bg_t))).mean()
 
-    # ĐỘT PHÁ V24: Trực giao Hóa Nguyên mẫu (Ép trung tâm FG và BG vuông góc 90 độ)
-    loss_ortho = 0.5 * (F.relu(ssim(fg_proto_o, bg_proto_o)) + F.relu(ssim(fg_proto_t, bg_proto_t))).mean()
+    pos_bg = torch.exp(ssim(bg_proto_o, bg_proto_t) / tau_p)
+    neg_bg_cross = 0.5 * (torch.exp(ssim(bg_proto_o, fg_proto_t) / tau_p) + torch.exp(ssim(bg_proto_t, fg_proto_o) / tau_p))
+    loss_global_bg = -torch.log(pos_bg / (pos_bg + neg_bg_cross)).mean()
 
     # ==========================================
-    # 3. ASYMMETRIC PIXEL-TO-PROTOTYPE (AP2P)
+    # 3. ĐỘT PHÁ V25: Boundary-Aware Margin Pixel-to-Prototype
     # ==========================================
     tau_dense = 0.2
     m_pos = 0.15 
@@ -189,6 +190,7 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     base_norm = F.normalize(base, p=2, dim=1)
     trans_norm = F.normalize(transformed, p=2, dim=1)
 
+    # Đóng băng Mỏ neo (Trạm hải đăng tĩnh bảo vệ khỏi sụp đổ)
     fg_p_o_stat = F.normalize(fg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
     bg_p_o_stat = F.normalize(bg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
     fg_p_t_stat = F.normalize(fg_proto_t, p=2, dim=-1).view(b, c, 1, 1).detach()
@@ -197,40 +199,60 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     soft_mask_o = segutils.downsample_mask(mask_base, h, w).unsqueeze(1)
     soft_mask_t = segutils.downsample_mask(mask_transformed, h, w).unsqueeze(1)
     
+    # --- BỘ LỌC RANH GIỚI BẰNG THỊ GIÁC MÁY TÍNH (Boundary-Aware Certainty) ---
+    kernel_size = 5
+    padding = kernel_size // 2
+    
+    # Tính độ bất định ảnh Gốc
+    blurred_mask_o = F.avg_pool2d(soft_mask_o, kernel_size, stride=1, padding=padding)
+    uncertainty_o = torch.abs(soft_mask_o - blurred_mask_o)
+    certainty_o = torch.exp(-5.0 * uncertainty_o) # Vùng biên uncertainty cao -> trọng số phạt trôi về 0
+    
+    # Tính độ bất định ảnh Biến đổi
+    blurred_mask_t = F.avg_pool2d(soft_mask_t, kernel_size, stride=1, padding=padding)
+    uncertainty_t = torch.abs(soft_mask_t - blurred_mask_t)
+    certainty_t = torch.exp(-5.0 * uncertainty_t)
+
+    # Lồng ghép độ tự tin vào Mask
+    eff_mask_fg_o = soft_mask_o * certainty_o
+    eff_mask_fg_t = soft_mask_t * certainty_t
+    
     bg_mask_o = torch.clamp(1.0 - soft_mask_o, min=0.0, max=1.0)
     bg_mask_t = torch.clamp(1.0 - soft_mask_t, min=0.0, max=1.0)
+    eff_mask_bg_o = bg_mask_o * certainty_o
+    eff_mask_bg_t = bg_mask_t * certainty_t
 
-    # --- A. FOREGROUND PIXELS: GOM CỤM CHẶT CHẼ (Dùng LogSumExp + Margin) ---
-    pos_fg_o_dense = ((base_norm * fg_p_t_stat).sum(dim=1, keepdim=True) - m_pos) / tau_dense
+    # --- A. CĂN CHỈNH TỪNG PIXEL TIỀN CẢNH (MiP2P V21) ---
+    pos_fg_o = ((base_norm * fg_p_t_stat).sum(dim=1, keepdim=True) - m_pos) / tau_dense
     neg_fg_o_1 = ((base_norm * bg_p_t_stat).sum(dim=1, keepdim=True) + m_neg) / tau_dense
     neg_fg_o_2 = ((base_norm * bg_p_o_stat).sum(dim=1, keepdim=True) + m_neg) / tau_dense
-    lse_fg_o = torch.logsumexp(torch.stack([pos_fg_o_dense, neg_fg_o_1, neg_fg_o_2], dim=-1), dim=-1)
-    loss_fg_map_o = lse_fg_o - pos_fg_o_dense
+    loss_fg_map_o = torch.logsumexp(torch.stack([pos_fg_o, neg_fg_o_1, neg_fg_o_2], dim=-1), dim=-1) - pos_fg_o
 
-    pos_fg_t_dense = ((trans_norm * fg_p_o_stat).sum(dim=1, keepdim=True) - m_pos) / tau_dense
+    pos_fg_t = ((trans_norm * fg_p_o_stat).sum(dim=1, keepdim=True) - m_pos) / tau_dense
     neg_fg_t_1 = ((trans_norm * bg_p_o_stat).sum(dim=1, keepdim=True) + m_neg) / tau_dense
     neg_fg_t_2 = ((trans_norm * bg_p_t_stat).sum(dim=1, keepdim=True) + m_neg) / tau_dense
-    lse_fg_t = torch.logsumexp(torch.stack([pos_fg_t_dense, neg_fg_t_1, neg_fg_t_2], dim=-1), dim=-1)
-    loss_fg_map_t = lse_fg_t - pos_fg_t_dense
+    loss_fg_map_t = torch.logsumexp(torch.stack([pos_fg_t, neg_fg_t_1, neg_fg_t_2], dim=-1), dim=-1) - pos_fg_t
 
-    loss_dense_fg = 0.5 * ((loss_fg_map_o * soft_mask_o).sum() / (soft_mask_o.sum() + 1e-6) +
-                           (loss_fg_map_t * soft_mask_t).sum() / (soft_mask_t.sum() + 1e-6))
+    # Áp dụng Effective Mask để mô hình né học rác ranh giới
+    loss_dense_fg = 0.5 * ((loss_fg_map_o * eff_mask_fg_o).sum() / (eff_mask_fg_o.sum() + 1e-6) +
+                           (loss_fg_map_t * eff_mask_fg_t).sum() / (eff_mask_fg_t.sum() + 1e-6))
 
-    # --- B. BACKGROUND PIXELS: CHỈ ĐẨY LÙI, KHÔNG GOM CỤM (Cho phép nền Đa phương thức) ---
-    # Ép các pixel Nền phải tách xa khỏi mỏ neo Tiền cảnh (ngưỡng 0.0)
-    neg_bg_o_1 = F.relu((base_norm * fg_p_t_stat).sum(dim=1, keepdim=True))
-    neg_bg_o_2 = F.relu((base_norm * fg_p_o_stat).sum(dim=1, keepdim=True))
-    loss_bg_map_o = neg_bg_o_1 + neg_bg_o_2
+    # --- B. CĂN CHỈNH TỪNG PIXEL HẬU CẢNH (MiP2P V21) ---
+    pos_bg_o = ((base_norm * bg_p_t_stat).sum(dim=1, keepdim=True) - m_pos) / tau_dense
+    neg_bg_o_1 = ((base_norm * fg_p_t_stat).sum(dim=1, keepdim=True) + m_neg) / tau_dense
+    neg_bg_o_2 = ((base_norm * fg_p_o_stat).sum(dim=1, keepdim=True) + m_neg) / tau_dense
+    loss_bg_map_o = torch.logsumexp(torch.stack([pos_bg_o, neg_bg_o_1, neg_bg_o_2], dim=-1), dim=-1) - pos_bg_o
 
-    neg_bg_t_1 = F.relu((trans_norm * fg_p_o_stat).sum(dim=1, keepdim=True))
-    neg_bg_t_2 = F.relu((trans_norm * fg_p_t_stat).sum(dim=1, keepdim=True))
-    loss_bg_map_t = neg_bg_t_1 + neg_bg_t_2
+    pos_bg_t = ((trans_norm * bg_p_o_stat).sum(dim=1, keepdim=True) - m_pos) / tau_dense
+    neg_bg_t_1 = ((trans_norm * fg_p_o_stat).sum(dim=1, keepdim=True) + m_neg) / tau_dense
+    neg_bg_t_2 = ((trans_norm * fg_p_t_stat).sum(dim=1, keepdim=True) + m_neg) / tau_dense
+    loss_bg_map_t = torch.logsumexp(torch.stack([pos_bg_t, neg_bg_t_1, neg_bg_t_2], dim=-1), dim=-1) - pos_bg_t
 
-    loss_dense_bg = 0.5 * ((loss_bg_map_o * bg_mask_o).sum() / (bg_mask_o.sum() + 1e-6) +
-                           (loss_bg_map_t * bg_mask_t).sum() / (bg_mask_t.sum() + 1e-6))
+    loss_dense_bg = 0.5 * ((loss_bg_map_o * eff_mask_bg_o).sum() / (eff_mask_bg_o.sum() + 1e-6) +
+                           (loss_bg_map_t * eff_mask_bg_t).sum() / (eff_mask_bg_t.sum() + 1e-6))
 
-    # Tỷ lệ tổng hợp: 1.0 (Global FG) + 0.2 (Ortho) + 0.5 (Dense FG) + 0.2 (Exclusion BG)
-    return loss_global_fg + 0.2 * loss_ortho + 0.5 * loss_dense_fg + 0.2 * loss_dense_bg
+    # Tỷ lệ tổng hợp
+    return loss_global_fg + 0.2 * loss_global_bg + 0.5 * loss_dense_fg + 0.2 * loss_dense_bg
 
 # -------------------hàm Lp ban đầu------------
 # features of base, transformed: [b,c,h,w]
