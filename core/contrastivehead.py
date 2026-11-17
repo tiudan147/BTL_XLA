@@ -170,54 +170,80 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     fg_proto_o, bg_proto_o = augwise_proto(base, mask_base, k, aug)
     fg_proto_t, bg_proto_t = augwise_proto(transformed, mask_transformed, k, aug)
 
-    # 2. Global InfoNCE (Symmetric - Neo giữ ngữ nghĩa an toàn)
+    # 2. Global InfoNCE (Symmetric)
     pos_fg = torch.exp(ssim(fg_proto_o, fg_proto_t) / tau_p)
     neg_bg_o = 0.5 * (torch.exp(ssim(fg_proto_o, bg_proto_t) / tau_p) + torch.exp(ssim(fg_proto_o, bg_proto_o) / tau_p))
     neg_bg_t = 0.5 * (torch.exp(ssim(fg_proto_t, bg_proto_o) / tau_p) + torch.exp(ssim(fg_proto_t, bg_proto_t) / tau_p))
-    loss_fg = 0.5 * (-torch.log(pos_fg / (pos_fg + neg_bg_o)) - torch.log(pos_fg / (pos_fg + neg_bg_t))).mean()
+    loss_global_fg = 0.5 * (-torch.log(pos_fg / (pos_fg + neg_bg_o)) - torch.log(pos_fg / (pos_fg + neg_bg_t))).mean()
 
     pos_bg = torch.exp(ssim(bg_proto_o, bg_proto_t) / tau_p)
     neg_bg_cross = 0.5 * (torch.exp(ssim(bg_proto_o, fg_proto_t) / tau_p) + torch.exp(ssim(bg_proto_t, fg_proto_o) / tau_p))
-    loss_bg = -torch.log(pos_bg / (pos_bg + neg_bg_cross)).mean()
+    loss_global_bg = -torch.log(pos_bg / (pos_bg + neg_bg_cross)).mean()
 
-    # 3. ĐỘT PHÁ V12: Confidence-Weighted Dense Consistency (CWDC)
-    soft_mask = segutils.downsample_mask(mask_base, h, w).unsqueeze(1) # [b, 1, h, w]
+    loss_msa = 0.0
 
-    base_norm = F.normalize(base, p=2, dim=1)
-    trans_norm = F.normalize(transformed, p=2, dim=1)
+    if h >= 10 and w >= 10: 
+        mask_4d = segutils.downsample_mask(mask_base, h, w).unsqueeze(1).float()
+        
+        # ==========================================
+        # A. GRID LEVEL (Bảo kê Deepglobe - Vũ khí của V7)
+        # ==========================================
+        grid_size = 3
+        grid_area = F.adaptive_avg_pool2d(mask_4d, (grid_size, grid_size))
+        valid_grid = (grid_area > 0.4).float().squeeze(1).view(b, grid_size * grid_size)
+        
+        local_fg_o = (F.adaptive_avg_pool2d(base * mask_4d, (grid_size, grid_size)) / (grid_area + 1e-6)).view(b, c, -1)
+        local_fg_t = (F.adaptive_avg_pool2d(transformed * mask_4d, (grid_size, grid_size)) / (grid_area + 1e-6)).view(b, c, -1)
+        
+        # Độ tương đồng vĩ mô (Grid Similarity)
+        grid_sim = F.cosine_similarity(local_fg_o, local_fg_t, dim=1) # [b, 9]
+        loss_grid_pos = ((1.0 - grid_sim) * valid_grid).sum() / (valid_grid.sum() + 1e-6)
+        
+        margin = 0.20
+        bg_o_expanded = bg_proto_o.unsqueeze(-1)
+        bg_t_expanded = bg_proto_t.unsqueeze(-1)
+        neg_l2g_o = F.relu(F.cosine_similarity(local_fg_o, bg_t_expanded, dim=1) - margin)
+        neg_l2g_t = F.relu(F.cosine_similarity(local_fg_t, bg_o_expanded, dim=1) - margin)
+        loss_grid_neg = ((neg_l2g_o + neg_l2g_t) * valid_grid).sum() / (valid_grid.sum() + 1e-6)
+        
+        loss_grid = loss_grid_pos + 0.5 * loss_grid_neg
 
-    # TÍNH TOÁN ĐỘ TỰ TIN (Dùng detach() để làm mốc so sánh tĩnh, không backprop)
-    fg_o_unsq = F.normalize(fg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
-    bg_o_unsq = F.normalize(bg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
+        # ==========================================
+        # B. PIXEL LEVEL (Mài sắc Lung/ISIC/SUIM - Vũ khí của V8)
+        # ==========================================
+        base_norm = F.normalize(base, p=2, dim=1)
+        trans_norm = F.normalize(transformed, p=2, dim=1)
+        
+        dense_pos = (base_norm * trans_norm).sum(dim=1, keepdim=True) # [b, 1, h, w]
+        raw_pixel_pos = 1.0 - dense_pos
+        
+        bg_o_norm = F.normalize(bg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
+        bg_t_norm = F.normalize(bg_proto_t, p=2, dim=-1).view(b, c, 1, 1).detach()
+        dense_neg_o = (base_norm * bg_t_norm).sum(dim=1, keepdim=True)
+        dense_neg_t = (trans_norm * bg_o_norm).sum(dim=1, keepdim=True)
+        raw_pixel_neg = 0.5 * (F.relu(dense_neg_o - 0.15) + F.relu(dense_neg_t - 0.15))
+        
+        raw_pixel_loss = raw_pixel_pos + raw_pixel_neg
 
-    sim_to_fg = (base_norm * fg_o_unsq).sum(dim=1, keepdim=True)
-    sim_to_bg = (base_norm * bg_o_unsq).sum(dim=1, keepdim=True)
+        # ==========================================
+        # C. THE MAGIC GATE (Cổng Đồng Thuận)
+        # ==========================================
+        # Reshape grid_sim (9 ô) về lại ma trận 3x3
+        grid_sim_2d = grid_sim.view(b, 1, grid_size, grid_size)
+        # Phóng to độ tự tin của lưới lên bằng đúng kích thước ảnh [h, w]
+        gate = F.interpolate(grid_sim_2d, size=(h, w), mode='bilinear', align_corners=False)
+        
+        # Chỉ những vùng ảnh có Grid Agreement > 0.2 mới được phép bật Pixel Loss
+        # Vùng nhiễu (Deepglobe) sẽ bị F.relu ép về 0, dập tắt Pixel Loss
+        trust_mask = F.relu(gate - 0.2)
+        effective_pixel_mask = mask_4d * trust_mask.detach()
+        
+        loss_pixel = (raw_pixel_loss * effective_pixel_mask).sum() / (effective_pixel_mask.sum() + 1e-6)
 
-    # Lọc tự tin bằng Softmax (Nếu giống FG hơn BG, weight ~ 1; nếu giống BG hơn, weight ~ 0)
-    tau_conf = 0.2
-    conf_weight = torch.exp(sim_to_fg / tau_conf) / (torch.exp(sim_to_fg / tau_conf) + torch.exp(sim_to_bg / tau_conf) + 1e-6)
+        # Tổng hợp: 0.4 Grid (luôn chạy) + 0.3 Pixel (chạy có chọn lọc)
+        loss_msa = 0.4 * loss_grid + 0.3 * loss_pixel
 
-    # Mặt nạ thực thi = Nhãn cung cấp * Độ tự tin của mô hình
-    # Lọc sạch bong 100% các pixel gán nhãn láo của Deepglobe!
-    effective_mask = soft_mask * conf_weight
-
-    # Nhánh 1: Đồng nhất từng pixel FG (Pixel-to-Pixel)
-    dense_pos = (base_norm * trans_norm).sum(dim=1, keepdim=True)
-    loss_pos = 1.0 - dense_pos
-
-    # Nhánh 2: L2G Margin Negative
-    bg_t_unsq = F.normalize(bg_proto_t, p=2, dim=-1).view(b, c, 1, 1).detach()
-    dense_neg_o = (base_norm * bg_t_unsq).sum(dim=1, keepdim=True)
-    dense_neg_t = (trans_norm * bg_o_unsq).sum(dim=1, keepdim=True)
-
-    margin = 0.15
-    loss_neg = 0.5 * (F.relu(dense_neg_o - margin) + F.relu(dense_neg_t - margin))
-
-    # Áp dụng Dense Loss SIÊU SẠCH (Đã được Confidence Mask gạt bỏ rác)
-    loss_dense = ((loss_pos + loss_neg) * effective_mask).sum() / (effective_mask.sum() + 1e-6)
-
-    # Tỷ lệ: 1.0 Global FG + 0.2 Global BG + 0.5 CWDC
-    return loss_fg + 0.2 * loss_bg + 0.5 * loss_dense
+    return loss_global_fg + 0.2 * loss_global_bg + loss_msa
 
 # -------------------hàm Lp ban đầu------------
 # features of base, transformed: [b,c,h,w]
