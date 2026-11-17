@@ -205,22 +205,22 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
         neg_hard_o = 0.5 * (torch.exp(ssim(fg_proto_o, bg_hard_t) / tau_p) + torch.exp(ssim(fg_proto_o, bg_hard_o) / tau_p))
         neg_hard_t = 0.5 * (torch.exp(ssim(fg_proto_t, bg_hard_o) / tau_p) + torch.exp(ssim(fg_proto_t, bg_hard_t) / tau_p))
         
-        # ĐỘT PHÁ V6: L2G-Margin (Local-to-Global Contrastive with Margin)
+        # ĐỘT PHÁ V7: Lưới hạt mịn 3x3 và Margin 0.20
+        grid_size = 3
         mask_4d = segutils.downsample_mask(mask_base, h, w).unsqueeze(1).float()
-        grid_area = F.adaptive_avg_pool2d(mask_4d, (2, 2))
-        valid_zones = (grid_area > 0.5).float().squeeze(1).view(b, 4)
+        grid_area = F.adaptive_avg_pool2d(mask_4d, (grid_size, grid_size))
+        # Ngưỡng 0.4 vì ô nhỏ hơn, dễ đạt tỷ lệ diện tích hơn
+        valid_zones = (grid_area > 0.4).float().squeeze(1).view(b, grid_size * grid_size)
         
-        local_fg_o = (F.adaptive_avg_pool2d(base * mask_4d, (2, 2)) / (grid_area + 1e-6)).view(b, c, 4)
-        local_fg_t = (F.adaptive_avg_pool2d(transformed * mask_4d, (2, 2)) / (grid_area + 1e-6)).view(b, c, 4)
+        local_fg_o = (F.adaptive_avg_pool2d(base * mask_4d, (grid_size, grid_size)) / (grid_area + 1e-6)).view(b, c, grid_size * grid_size)
+        local_fg_t = (F.adaptive_avg_pool2d(transformed * mask_4d, (grid_size, grid_size)) / (grid_area + 1e-6)).view(b, c, grid_size * grid_size)
         
-        # Nhánh 1: Đồng nhất Tiền cảnh cục bộ (Local Positives)
         local_sim = F.cosine_similarity(local_fg_o, local_fg_t, dim=1)
         loss_local_pos = ((1.0 - local_sim) * valid_zones).sum() / (valid_zones.sum() + 1e-6)
         
-        # Nhánh 2: Đẩy lùi Nền toàn cục với Margin = 0.15 (Local-to-Global Negatives)
-        margin = 0.15
-        bg_o_expanded = bg_proto_o.unsqueeze(-1) # [b, c, 1]
-        bg_t_expanded = bg_proto_t.unsqueeze(-1) # [b, c, 1]
+        margin = 0.20
+        bg_o_expanded = bg_proto_o.unsqueeze(-1)
+        bg_t_expanded = bg_proto_t.unsqueeze(-1)
         
         neg_l2g_o = F.relu(F.cosine_similarity(local_fg_o, bg_t_expanded, dim=1) - margin)
         neg_l2g_t = F.relu(F.cosine_similarity(local_fg_t, bg_o_expanded, dim=1) - margin)
@@ -241,8 +241,8 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     neg_bg_cross = 0.5 * (torch.exp(ssim(bg_proto_o, fg_proto_t) / tau_p) + torch.exp(ssim(bg_proto_t, fg_proto_o) / tau_p))
     loss_bg = -torch.log(pos_bg / (pos_bg + neg_bg_cross)).mean()
 
-    # Tăng nhẹ trọng số của loss_local lên 0.3 để L2G Margin phát huy trên Deepglobe
-    return loss_fg + 0.2 * loss_bg + 0.3 * loss_local
+    # Tăng trọng số loss_local lên 0.4
+    return loss_fg + 0.2 * loss_bg + 0.4 * loss_local
 
 # -------------------hàm Lp ban đầu------------
 # features of base, transformed: [b,c,h,w]
