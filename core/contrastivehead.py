@@ -212,46 +212,8 @@ def keep_var_loss(original_features, transformed_features):
     return keepvarloss
 
 #-----------------------------------------------------
-#         Đổi loss lần 2
-#---------------------------------------------------------
-
-class EnhancedAdaptationLoss(nn.Module):
-    def __init__(self, margin=0.15, lambda_ortho=0.5, lambda_bg=0.5):
-        super().__init__()
-        self.margin = margin
-        self.lambda_ortho = lambda_ortho
-        self.lambda_bg = lambda_bg
-    def forward(self, feat_map, support_mask):
-        """
-        feat_map: Tensor đặc trưng [B, C, H, W]
-        support_mask: Mặt nạ nhị phân [B, H, W] hoặc [B, 1, H, W]
-        """
-        if support_mask.dim() == 3:
-            support_mask = support_mask.unsqueeze(1)
-        # Chuẩn hóa L2 đặc trưng theo chiều kênh
-        feat_norm = F.normalize(feat_map, p=2, dim=1)
-        
-        fg_mask = (support_mask > 0.5).float()
-        bg_mask = 1.0 - fg_mask
-        # Tính Prototype tiền cảnh (P_fg) và hậu cảnh (P_bg)
-        fg_sum = (feat_norm * fg_mask).sum(dim=(2, 3))
-        bg_sum = (feat_norm * bg_mask).sum(dim=(2, 3))
-        
-        p_fg = F.normalize(fg_sum / (fg_mask.sum(dim=(2, 3)) + 1e-6), p=2, dim=1)
-        p_bg = F.normalize(bg_sum / (bg_mask.sum(dim=(2, 3)) + 1e-6), p=2, dim=1)
-        # 1. Orthogonality Loss: Ép P_fg và P_bg tách biệt (cosine <= 0)
-        cos_fg_bg = (p_fg * p_bg).sum(dim=1)
-        loss_ortho = F.relu(cos_fg_bg).mean()
-        # 2. Hard-Background Margin Loss: Đẩy các pixel nền dễ nhầm lẫn ra xa P_fg
-        sim_to_fg = (feat_norm * p_fg.unsqueeze(-1).unsqueeze(-1)).sum(dim=1, keepdim=True)
-        hard_bg_penalty = F.relu(sim_to_fg - self.margin) * bg_mask
-        loss_bg_margin = hard_bg_penalty.sum() / (bg_mask.sum() + 1e-6)
-        return self.lambda_ortho * loss_ortho + self.lambda_bg * loss_bg_margin
-
-#-----------------------------------------------------
 #         Vị trí mạng adapter
 #---------------------------------------------------------
-
 
 #-------------------NAF------------------------------
 
@@ -307,73 +269,35 @@ class LCFAttention(nn.Module):
     def __init__(self, channels=64):
         super(LCFAttention, self).__init__()
         
-        # 1. Depthwise 3x3
+        # 1. Depthwise 3x3: Chiều chuộng Lung/ISIC (Lấy hình khối, không làm mờ chéo)
         self.dw_conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False)
+        
+        # 2. LayerNorm: Chiều chuộng Few-Shot (Miễn nhiễm hoàn toàn với Batch Size = 1)
         self.norm = nn.LayerNorm(channels, eps=1e-6)
         
-        # 2. ECA Channel Attention
+        # 3. ECA Conv1D: Chiều chuộng Deepglobe (Đánh trọng số kênh không cần nén)
         self.eca_pool = nn.AdaptiveAvgPool2d(1)
         self.eca_conv = nn.Conv1d(1, 1, kernel_size=3, padding=1, bias=False)
         self.sigmoid = nn.Sigmoid()
-        # 3. Phép gộp cục bộ để trích xuất tần số cao (High-Pass / Unsharp Masking)
-        self.avg_pool = nn.AvgPool2d(kernel_size=3, stride=1, padding=1)
-        # 4. Hệ số cổng học được, khởi tạo nhỏ bằng 0.1
-        self.gamma = nn.Parameter(torch.tensor(0.1))
+
     def forward(self, x):
         identity = x
         
-        # Trích xuất chi tiết tần số cao: X - AvgPool(X)
-        high_freq = x - self.avg_pool(x)
+        # Bước 1: Trích xuất không gian lân cận
+        out = self.dw_conv(x)
         
-        # Trích xuất không gian lân cận + cộng chi tiết tần số cao
-        out = self.dw_conv(x) + high_freq
-        
-        # Chuẩn hóa LayerNorm
-        out = out.permute(0, 2, 3, 1)
+        # Bước 2: Chuẩn hóa cực kỳ ổn định bằng LayerNorm
+        out = out.permute(0, 2, 3, 1) # Đảo chiều B, C, H, W -> B, H, W, C
         out = self.norm(out)
-        out = out.permute(0, 3, 1, 2)
+        out = out.permute(0, 3, 1, 2) # Đảo lại B, C, H, W
         
-        # Trọng số kênh ECA
-        v = self.eca_pool(out).squeeze(-1).transpose(-1, -2)
+        # Bước 3: Trích xuất trọng số Kênh (ECA)
+        v = self.eca_pool(out).squeeze(-1).transpose(-1, -2) # [B, 1, C]
         v = self.eca_conv(v)
-        v = v.transpose(-1, -2).unsqueeze(-1)
+        v = v.transpose(-1, -2).unsqueeze(-1) # [B, C, 1, 1]
         
-        # Kết hợp qua hệ số cổng gamma: identity + gamma * (out * attention)
-        return identity + self.gamma * (out * self.sigmoid(v))
-
-# class LCFAttention(nn.Module):
-#     def __init__(self, channels=64):
-#         super(LCFAttention, self).__init__()
-        
-#         # 1. Depthwise 3x3: Chiều chuộng Lung/ISIC (Lấy hình khối, không làm mờ chéo)
-#         self.dw_conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False)
-        
-#         # 2. LayerNorm: Chiều chuộng Few-Shot (Miễn nhiễm hoàn toàn với Batch Size = 1)
-#         self.norm = nn.LayerNorm(channels, eps=1e-6)
-        
-#         # 3. ECA Conv1D: Chiều chuộng Deepglobe (Đánh trọng số kênh không cần nén)
-#         self.eca_pool = nn.AdaptiveAvgPool2d(1)
-#         self.eca_conv = nn.Conv1d(1, 1, kernel_size=3, padding=1, bias=False)
-#         self.sigmoid = nn.Sigmoid()
-
-#     def forward(self, x):
-#         identity = x
-        
-#         # Bước 1: Trích xuất không gian lân cận
-#         out = self.dw_conv(x)
-        
-#         # Bước 2: Chuẩn hóa cực kỳ ổn định bằng LayerNorm
-#         out = out.permute(0, 2, 3, 1) # Đảo chiều B, C, H, W -> B, H, W, C
-#         out = self.norm(out)
-#         out = out.permute(0, 3, 1, 2) # Đảo lại B, C, H, W
-        
-#         # Bước 3: Trích xuất trọng số Kênh (ECA)
-#         v = self.eca_pool(out).squeeze(-1).transpose(-1, -2) # [B, 1, C]
-#         v = self.eca_conv(v)
-#         v = v.transpose(-1, -2).unsqueeze(-1) # [B, C, 1, 1]
-        
-#         # Bước 4: Trộn trọng số và Cộng Residual giữ độ nét
-#         return identity + (out * self.sigmoid(v))
+        # Bước 4: Trộn trọng số và Cộng Residual giữ độ nét
+        return identity + (out * self.sigmoid(v))
 
 
 class ContrastiveFeatureTransformer(nn.Module):
@@ -461,9 +385,6 @@ class ContrastiveFeatureTransformer(nn.Module):
         self.prepend_relu = config_model.prepend_relu
         self.append_normalize = config_model.append_normalize
 
-        # -----------------------------------Xóa đây-----------------------------------
-        self.enhanced_loss_fn = EnhancedAdaptationLoss(margin=0.15, lambda_ortho=0.5, lambda_bg=0.5)
-
     def forward(self, x):
         if self.prepend_relu:
             x = F.relu(x)
@@ -547,12 +468,7 @@ class ContrastiveFeatureTransformer(nn.Module):
             # Aggregate loss
             # loss = qloss + sloss + q_s_loss_diff + proto_loss
 
-            # loss = qloss + sloss + q_s_loss_diff + (1.5 * proto_loss) # loss giúp tăng cho lung
-
-            # Tính thêm Enhanced Adaptation Loss (Orthogonality + Hard-Background Margin)
-            loss_enhanced = self.enhanced_loss_fn(transformed_features, augmented_smasks)
-            # Cập nhật tổng Loss
-            loss = qloss + sloss + q_s_loss_diff + (1.5 * proto_loss) + loss_enhanced
+            loss = qloss + sloss + q_s_loss_diff + (1.5 * proto_loss) # loss giúp tăng cho lung
             
             assert loss.isfinite().all(), f"invalid contrastive loss:{loss}"
 
