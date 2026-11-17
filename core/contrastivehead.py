@@ -161,7 +161,7 @@ def self_attention_loss(f_base, f_transformed, mask_base, mask_transformed, k, a
 #            Nơi định nghĩa hàm loss Lp
 #------------------------------------------------
 
-def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, aug, tau_p=0.5, tau_hard=0.25):
+def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, aug, tau_p=0.5):
     assert transformed.shape == base.shape, ".."
     b, c, h, w = base.shape
     assert b == k * aug, 'provide correct k and aug such that dim0=k*aug'
@@ -170,79 +170,51 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     fg_proto_o, bg_proto_o = augwise_proto(base, mask_base, k, aug)
     fg_proto_t, bg_proto_t = augwise_proto(transformed, mask_transformed, k, aug)
 
+    # 2. Global InfoNCE Loss
     pos_fg = torch.exp(ssim(fg_proto_o, fg_proto_t) / tau_p)
-
-    neg_hard_o = 0.0
-    neg_hard_t = 0.0
-    loss_local = 0.0
-
-    if h >= 20 and w >= 20: 
-        feat_o_aug = torch.cat(base.view(k, aug, c, h * w).unbind(0), dim=-1)
-        feat_t_aug = torch.cat(transformed.view(k, aug, c, h * w).unbind(0), dim=-1)
-        mask_aug = torch.cat(segutils.downsample_mask(mask_base, h, w).view(k, aug, h * w).unbind(0), dim=-1)
-        
-        bg_mask = torch.clamp(1.0 - mask_aug, min=0.0, max=1.0)
-        
-        feat_o_norm = F.normalize(feat_o_aug, p=2, dim=1)
-        feat_t_norm = F.normalize(feat_t_aug, p=2, dim=1)
-        fg_o_norm = F.normalize(fg_proto_o, p=2, dim=-1).unsqueeze(-1)
-        fg_t_norm = F.normalize(fg_proto_t, p=2, dim=-1).unsqueeze(-1)
-        
-        sim_pixel_o = torch.sum(feat_o_norm * fg_o_norm.detach(), dim=1)
-        sim_pixel_t = torch.sum(feat_t_norm * fg_t_norm.detach(), dim=1)
-        
-        logits_bg_o = (sim_pixel_o / tau_hard).masked_fill(bg_mask < 0.1, -1e4)
-        logits_bg_t = (sim_pixel_t / tau_hard).masked_fill(bg_mask < 0.1, -1e4)
-        
-        weights_bg_o = F.softmax(logits_bg_o, dim=-1) * bg_mask
-        weights_bg_o = weights_bg_o / (weights_bg_o.sum(dim=-1, keepdim=True) + 1e-6)
-        weights_bg_t = F.softmax(logits_bg_t, dim=-1) * bg_mask
-        weights_bg_t = weights_bg_t / (weights_bg_t.sum(dim=-1, keepdim=True) + 1e-6)
-        
-        bg_hard_o = torch.einsum('acn,an->ac', feat_o_aug, weights_bg_o)
-        bg_hard_t = torch.einsum('acn,an->ac', feat_t_aug, weights_bg_t)
-        
-        neg_hard_o = 0.5 * (torch.exp(ssim(fg_proto_o, bg_hard_t) / tau_p) + torch.exp(ssim(fg_proto_o, bg_hard_o) / tau_p))
-        neg_hard_t = 0.5 * (torch.exp(ssim(fg_proto_t, bg_hard_o) / tau_p) + torch.exp(ssim(fg_proto_t, bg_hard_t) / tau_p))
-        
-        # ĐỘT PHÁ V7: Lưới hạt mịn 3x3 và Margin 0.20
-        grid_size = 3
-        mask_4d = segutils.downsample_mask(mask_base, h, w).unsqueeze(1).float()
-        grid_area = F.adaptive_avg_pool2d(mask_4d, (grid_size, grid_size))
-        # Ngưỡng 0.4 vì ô nhỏ hơn, dễ đạt tỷ lệ diện tích hơn
-        valid_zones = (grid_area > 0.4).float().squeeze(1).view(b, grid_size * grid_size)
-        
-        local_fg_o = (F.adaptive_avg_pool2d(base * mask_4d, (grid_size, grid_size)) / (grid_area + 1e-6)).view(b, c, grid_size * grid_size)
-        local_fg_t = (F.adaptive_avg_pool2d(transformed * mask_4d, (grid_size, grid_size)) / (grid_area + 1e-6)).view(b, c, grid_size * grid_size)
-        
-        local_sim = F.cosine_similarity(local_fg_o, local_fg_t, dim=1)
-        loss_local_pos = ((1.0 - local_sim) * valid_zones).sum() / (valid_zones.sum() + 1e-6)
-        
-        margin = 0.20
-        bg_o_expanded = bg_proto_o.unsqueeze(-1)
-        bg_t_expanded = bg_proto_t.unsqueeze(-1)
-        
-        neg_l2g_o = F.relu(F.cosine_similarity(local_fg_o, bg_t_expanded, dim=1) - margin)
-        neg_l2g_t = F.relu(F.cosine_similarity(local_fg_t, bg_o_expanded, dim=1) - margin)
-        loss_local_neg = ((neg_l2g_o + neg_l2g_t) * valid_zones).sum() / (valid_zones.sum() + 1e-6)
-        
-        loss_local = loss_local_pos + 0.5 * loss_local_neg
-
-    # 3. Tổng hợp Symmetric Foreground Loss
     neg_bg_o = 0.5 * (torch.exp(ssim(fg_proto_o, bg_proto_t) / tau_p) + torch.exp(ssim(fg_proto_o, bg_proto_o) / tau_p))
     neg_bg_t = 0.5 * (torch.exp(ssim(fg_proto_t, bg_proto_o) / tau_p) + torch.exp(ssim(fg_proto_t, bg_proto_t) / tau_p))
     
-    loss_fg_o = -torch.log(pos_fg / (pos_fg + neg_bg_o + neg_hard_o))
-    loss_fg_t = -torch.log(pos_fg / (pos_fg + neg_bg_t + neg_hard_t))
+    loss_fg_o = -torch.log(pos_fg / (pos_fg + neg_bg_o))
+    loss_fg_t = -torch.log(pos_fg / (pos_fg + neg_bg_t))
     loss_fg = 0.5 * (loss_fg_o + loss_fg_t).mean()
-
-    # 4. Background Consistency
+    
     pos_bg = torch.exp(ssim(bg_proto_o, bg_proto_t) / tau_p)
     neg_bg_cross = 0.5 * (torch.exp(ssim(bg_proto_o, fg_proto_t) / tau_p) + torch.exp(ssim(bg_proto_t, fg_proto_o) / tau_p))
     loss_bg = -torch.log(pos_bg / (pos_bg + neg_bg_cross)).mean()
 
-    # Tăng trọng số loss_local lên 0.4
-    return loss_fg + 0.2 * loss_bg + 0.4 * loss_local
+    # 3. ĐỘT PHÁ V8: Dense Pixel-Level Consistency (DPC)
+    loss_dense = 0.0
+    if h >= 20 and w >= 20: 
+        # Giữ độ mềm của mask (Bilinear downsample)
+        fg_mask = segutils.downsample_mask(mask_base, h, w).unsqueeze(1) # [b, 1, h, w]
+        
+        # Chuẩn hóa đặc trưng trên toàn bản đồ
+        base_norm = F.normalize(base, p=2, dim=1)
+        trans_norm = F.normalize(transformed, p=2, dim=1)
+        
+        # Nhánh 1: Đồng nhất chính xác từng pixel FG (Pixel-to-Pixel)
+        dense_pos = (base_norm * trans_norm).sum(dim=1, keepdim=True) # [b, 1, h, w]
+        loss_pos = 1.0 - dense_pos
+        
+        # Nhánh 2: Ép từng pixel FG tách xa khỏi Nền toàn cục với Margin
+        # Mở rộng Global BG để nhân Dense
+        bg_o_norm = F.normalize(bg_proto_o, p=2, dim=-1).repeat(k, 1).view(b, c, 1, 1)
+        bg_t_norm = F.normalize(bg_proto_t, p=2, dim=-1).repeat(k, 1).view(b, c, 1, 1)
+        
+        # Tính tương đồng Cosine của mọi pixel FG với Global BG
+        dense_neg_o = (base_norm * bg_t_norm.detach()).sum(dim=1, keepdim=True)
+        dense_neg_t = (trans_norm * bg_o_norm.detach()).sum(dim=1, keepdim=True)
+        
+        margin = 0.15
+        loss_neg = 0.5 * (F.relu(dense_neg_o - margin) + F.relu(dense_neg_t - margin))
+        
+        # Chỉ tính loss ở những vùng có FG
+        pixel_loss = loss_pos + loss_neg
+        loss_dense = (pixel_loss * fg_mask).sum() / (fg_mask.sum() + 1e-6)
+
+    # Tỷ lệ 1.0 (Global FG) - 0.2 (Global BG) - 0.5 (Dense Pixel)
+    return loss_fg + 0.2 * loss_bg + 0.5 * loss_dense
 
 # -------------------hàm Lp ban đầu------------
 # features of base, transformed: [b,c,h,w]
