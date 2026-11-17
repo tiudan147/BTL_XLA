@@ -166,11 +166,11 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     b, c, h, w = base.shape
     assert b == k * aug, 'provide correct k and aug such that dim0=k*aug'
 
-    # 1. Global Prototypes
+    # 1. Global Prototypes (Nền tảng neo giữ)
     fg_proto_o, bg_proto_o = augwise_proto(base, mask_base, k, aug)
     fg_proto_t, bg_proto_t = augwise_proto(transformed, mask_transformed, k, aug)
 
-    # 2. Global InfoNCE (Symmetric)
+    # 2. Global InfoNCE (Symmetric - Duy trì bức tranh toàn cảnh)
     pos_fg = torch.exp(ssim(fg_proto_o, fg_proto_t) / tau_p)
     neg_bg_o = 0.5 * (torch.exp(ssim(fg_proto_o, bg_proto_t) / tau_p) + torch.exp(ssim(fg_proto_o, bg_proto_o) / tau_p))
     neg_bg_t = 0.5 * (torch.exp(ssim(fg_proto_t, bg_proto_o) / tau_p) + torch.exp(ssim(fg_proto_t, bg_proto_t) / tau_p))
@@ -180,70 +180,61 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     neg_bg_cross = 0.5 * (torch.exp(ssim(bg_proto_o, fg_proto_t) / tau_p) + torch.exp(ssim(bg_proto_t, fg_proto_o) / tau_p))
     loss_global_bg = -torch.log(pos_bg / (pos_bg + neg_bg_cross)).mean()
 
-    loss_msa = 0.0
+    # ==========================================
+    # 3. ĐỘT PHÁ V14: DENSE PIXEL-LEVEL INFONCE
+    # (Tự động thích ứng, triệt tiêu nhãn nhiễu bằng LogSumExp)
+    # ==========================================
+    
+    soft_mask = segutils.downsample_mask(mask_base, h, w).unsqueeze(1) # [b, 1, h, w]
+    bg_mask = torch.clamp(1.0 - soft_mask, min=0.0, max=1.0)
+    
+    base_norm = F.normalize(base, p=2, dim=1)
+    trans_norm = F.normalize(transformed, p=2, dim=1)
+    
+    # A. Tìm Hard Background (Vùng nền dễ gây nhầm lẫn nhất)
+    tau_hard = 0.25
+    fg_o_unsq = F.normalize(fg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
+    fg_t_unsq = F.normalize(fg_proto_t, p=2, dim=-1).view(b, c, 1, 1).detach()
+    
+    sim_bg_fg_o = (base_norm * fg_o_unsq).sum(dim=1, keepdim=True)
+    logits_bg_o = (sim_bg_fg_o / tau_hard).masked_fill(bg_mask < 0.1, -1e4)
+    weights_bg_o = F.softmax(logits_bg_o.view(b, -1), dim=-1).view(b, 1, h, w) * bg_mask
+    bg_hard_o = (base * weights_bg_o).sum(dim=(2,3)) / (weights_bg_o.sum(dim=(2,3)) + 1e-6)
+    bg_hard_o = F.normalize(bg_hard_o, p=2, dim=1).view(b, c, 1, 1)
+    
+    sim_bg_fg_t = (trans_norm * fg_t_unsq).sum(dim=1, keepdim=True)
+    logits_bg_t = (sim_bg_fg_t / tau_hard).masked_fill(bg_mask < 0.1, -1e4)
+    weights_bg_t = F.softmax(logits_bg_t.view(b, -1), dim=-1).view(b, 1, h, w) * bg_mask
+    bg_hard_t = (transformed * weights_bg_t).sum(dim=(2,3)) / (weights_bg_t.sum(dim=(2,3)) + 1e-6)
+    bg_hard_t = F.normalize(bg_hard_t, p=2, dim=1).view(b, c, 1, 1)
+    
+    # B. Xây dựng Dense InfoNCE (Tự động triệt tiêu rác)
+    tau_dense = 0.15
+    
+    # Positive (Tử số): Khớp pixel gốc với chính nó sau biến đổi
+    pos_dense = (base_norm * trans_norm).sum(dim=1, keepdim=True) / tau_dense # [b, 1, h, w]
+    
+    # Negatives (Mẫu số): Đẩy pixel ra xa Global BG và Hard BG
+    bg_o_unsq = F.normalize(bg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
+    bg_t_unsq = F.normalize(bg_proto_t, p=2, dim=-1).view(b, c, 1, 1).detach()
+    
+    neg_bg_o = (base_norm * bg_o_unsq).sum(dim=1, keepdim=True) / tau_dense
+    neg_bg_t = (base_norm * bg_t_unsq).sum(dim=1, keepdim=True) / tau_dense
+    neg_hard_o = (base_norm * bg_hard_o).sum(dim=1, keepdim=True) / tau_dense
+    neg_hard_t = (base_norm * bg_hard_t).sum(dim=1, keepdim=True) / tau_dense
+    
+    # Tính LogSumExp: Công thức InfoNCE gốc rễ
+    all_logits = torch.stack([pos_dense, neg_bg_o, neg_bg_t, neg_hard_o, neg_hard_t], dim=-1)
+    lse_all = torch.logsumexp(all_logits, dim=-1) # [b, 1, h, w]
+    
+    # Loss = LogSumExp(tất cả) - Positive = -log( exp(pos) / sum(exp(all)) )
+    loss_dense_map = lse_all - pos_dense 
+    
+    # Chỉ tính Loss trung bình trên các pixel thuộc Tiền cảnh
+    loss_dense = (loss_dense_map * soft_mask).sum() / (soft_mask.sum() + 1e-6)
 
-    if h >= 10 and w >= 10: 
-        mask_4d = segutils.downsample_mask(mask_base, h, w).unsqueeze(1).float()
-        
-        # ==========================================
-        # A. GRID LEVEL (Bảo kê Deepglobe - Vũ khí của V7)
-        # ==========================================
-        grid_size = 3
-        grid_area = F.adaptive_avg_pool2d(mask_4d, (grid_size, grid_size))
-        valid_grid = (grid_area > 0.4).float().squeeze(1).view(b, grid_size * grid_size)
-        
-        local_fg_o = (F.adaptive_avg_pool2d(base * mask_4d, (grid_size, grid_size)) / (grid_area + 1e-6)).view(b, c, -1)
-        local_fg_t = (F.adaptive_avg_pool2d(transformed * mask_4d, (grid_size, grid_size)) / (grid_area + 1e-6)).view(b, c, -1)
-        
-        # Độ tương đồng vĩ mô (Grid Similarity)
-        grid_sim = F.cosine_similarity(local_fg_o, local_fg_t, dim=1) # [b, 9]
-        loss_grid_pos = ((1.0 - grid_sim) * valid_grid).sum() / (valid_grid.sum() + 1e-6)
-        
-        margin = 0.20
-        bg_o_expanded = bg_proto_o.unsqueeze(-1)
-        bg_t_expanded = bg_proto_t.unsqueeze(-1)
-        neg_l2g_o = F.relu(F.cosine_similarity(local_fg_o, bg_t_expanded, dim=1) - margin)
-        neg_l2g_t = F.relu(F.cosine_similarity(local_fg_t, bg_o_expanded, dim=1) - margin)
-        loss_grid_neg = ((neg_l2g_o + neg_l2g_t) * valid_grid).sum() / (valid_grid.sum() + 1e-6)
-        
-        loss_grid = loss_grid_pos + 0.5 * loss_grid_neg
-
-        # ==========================================
-        # B. PIXEL LEVEL (Mài sắc Lung/ISIC/SUIM - Vũ khí của V8)
-        # ==========================================
-        base_norm = F.normalize(base, p=2, dim=1)
-        trans_norm = F.normalize(transformed, p=2, dim=1)
-        
-        dense_pos = (base_norm * trans_norm).sum(dim=1, keepdim=True) # [b, 1, h, w]
-        raw_pixel_pos = 1.0 - dense_pos
-        
-        bg_o_norm = F.normalize(bg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
-        bg_t_norm = F.normalize(bg_proto_t, p=2, dim=-1).view(b, c, 1, 1).detach()
-        dense_neg_o = (base_norm * bg_t_norm).sum(dim=1, keepdim=True)
-        dense_neg_t = (trans_norm * bg_o_norm).sum(dim=1, keepdim=True)
-        raw_pixel_neg = 0.5 * (F.relu(dense_neg_o - 0.15) + F.relu(dense_neg_t - 0.15))
-        
-        raw_pixel_loss = raw_pixel_pos + raw_pixel_neg
-
-        # ==========================================
-        # C. THE MAGIC GATE (Cổng Đồng Thuận)
-        # ==========================================
-        # Reshape grid_sim (9 ô) về lại ma trận 3x3
-        grid_sim_2d = grid_sim.view(b, 1, grid_size, grid_size)
-        # Phóng to độ tự tin của lưới lên bằng đúng kích thước ảnh [h, w]
-        gate = F.interpolate(grid_sim_2d, size=(h, w), mode='bilinear', align_corners=False)
-        
-        # Chỉ những vùng ảnh có Grid Agreement > 0.2 mới được phép bật Pixel Loss
-        # Vùng nhiễu (Deepglobe) sẽ bị F.relu ép về 0, dập tắt Pixel Loss
-        trust_mask = F.relu(gate - 0.2)
-        effective_pixel_mask = mask_4d * trust_mask.detach()
-        
-        loss_pixel = (raw_pixel_loss * effective_pixel_mask).sum() / (effective_pixel_mask.sum() + 1e-6)
-
-        # Tổng hợp: 0.4 Grid (luôn chạy) + 0.3 Pixel (chạy có chọn lọc)
-        loss_msa = 0.4 * loss_grid + 0.3 * loss_pixel
-
-    return loss_global_fg + 0.2 * loss_global_bg + loss_msa
+    # Tỷ lệ tổng hợp: 1.0 (Global FG) - 0.2 (Global BG) - 0.4 (Dense InfoNCE)
+    return loss_global_fg + 0.2 * loss_global_bg + 0.4 * loss_dense
 
 # -------------------hàm Lp ban đầu------------
 # features of base, transformed: [b,c,h,w]
