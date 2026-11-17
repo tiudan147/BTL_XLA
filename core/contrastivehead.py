@@ -161,46 +161,76 @@ def self_attention_loss(f_base, f_transformed, mask_base, mask_transformed, k, a
 #            Nơi định nghĩa hàm loss Lp
 #------------------------------------------------
 
-def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, aug, tau_p=0.8):
+def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, aug, tau_p=0.5, tau_hard=0.25):
     assert transformed.shape == base.shape, ".."
     b, c, h, w = base.shape
     assert b == k * aug, 'provide correct k and aug such that dim0=k*aug'
-    assert mask_base.shape == mask_transformed.shape == (b, h, w), ".."
 
-    # 1. Global Prototypes chuẩn xác từ augwise_proto (Không cắt ngưỡng cứng gây hại viền)
+    # 1. Global Prototypes (Nền tảng ổn định)
     fg_proto_o, bg_proto_o = augwise_proto(base, mask_base, k, aug)
     fg_proto_t, bg_proto_t = augwise_proto(transformed, mask_transformed, k, aug)
 
-    # 2. Symmetric Foreground Contrast (Kết hợp đẩy cả BG chéo và BG nội tại cùng thang đo)
     pos_fg = torch.exp(ssim(fg_proto_o, fg_proto_t) / tau_p)
-    
-    # Trung bình cộng lực đẩy inter-view (fg_o <-> bg_t) và intra-view (fg_o <-> bg_o)
-    neg_fg_o = 0.5 * (torch.exp(ssim(fg_proto_o, bg_proto_t) / tau_p) + torch.exp(ssim(fg_proto_o, bg_proto_o) / tau_p))
-    neg_fg_t = 0.5 * (torch.exp(ssim(fg_proto_t, bg_proto_o) / tau_p) + torch.exp(ssim(fg_proto_t, bg_proto_t) / tau_p))
 
-    loss_fg_o = -torch.log(pos_fg / (pos_fg + neg_fg_o))
-    loss_fg_t = -torch.log(pos_fg / (pos_fg + neg_fg_t))
-    loss_fg = 0.5 * (loss_fg_o + loss_fg_t).mean()
+    # 2. Adaptive Hard-Background & Local Grid (CHỈ kích hoạt ở tầng L, M)
+    neg_hard_o = 0.0
+    neg_hard_t = 0.0
+    loss_local = 0.0
 
-    # 3. Background View-Consistency (Giữ cụm nền ổn định cho Softmax ở bước Dense Comparison)
-    pos_bg = torch.exp(ssim(bg_proto_o, bg_proto_t) / tau_p)
-    neg_bg = 0.5 * (torch.exp(ssim(bg_proto_o, fg_proto_t) / tau_p) + torch.exp(ssim(bg_proto_t, fg_proto_o) / tau_p))
-    loss_bg = -torch.log(pos_bg / (pos_bg + neg_bg)).mean()
-
-    # 4. Selective Local Grid 2x2: CHỈ bật ở các tầng nông & trung (L, M: h >= 20) cho Deepglobe/ISIC
-    # Tự động tắt ở tầng sâu (H: 13x13) để không làm vỡ vật thể nhỏ của SUIM và cấu trúc của Lung
-    if h >= 20 and w >= 20:
-        mask_4d = segutils.downsample_mask(mask_base, h, w).unsqueeze(1).float()  # [b, 1, h, w]
-        grid_area = F.adaptive_avg_pool2d(mask_4d, (2, 2))                        # [b, 1, 2, 2]
-        valid_zones = (grid_area > 0.15).float().squeeze(1).view(b, 4)            # Chỉ xét ô có >= 15% diện tích FG
-
+    if h >= 20 and w >= 20: # Bảo vệ tầng sâu (H) của Lung, SUIM
+        # A. Attentive Hard-Background Mining (Vũ khí cho Deepglobe, ISIC)
+        feat_o_aug = torch.cat(base.view(k, aug, c, h * w).unbind(0), dim=-1)
+        feat_t_aug = torch.cat(transformed.view(k, aug, c, h * w).unbind(0), dim=-1)
+        mask_aug = torch.cat(segutils.downsample_mask(mask_base, h, w).view(k, aug, h * w).unbind(0), dim=-1)
+        
+        bg_mask = (mask_aug <= 0.5).float()
+        
+        # Softmax Attention để tìm điểm nền khó nhất
+        feat_o_norm = F.normalize(feat_o_aug, p=2, dim=1)
+        feat_t_norm = F.normalize(feat_t_aug, p=2, dim=1)
+        fg_o_norm = F.normalize(fg_proto_o, p=2, dim=-1).unsqueeze(-1)
+        fg_t_norm = F.normalize(fg_proto_t, p=2, dim=-1).unsqueeze(-1)
+        
+        sim_pixel_o = torch.sum(feat_o_norm * fg_o_norm.detach(), dim=1)
+        sim_pixel_t = torch.sum(feat_t_norm * fg_t_norm.detach(), dim=1)
+        
+        logits_bg_o = (sim_pixel_o / tau_hard).masked_fill(bg_mask < 0.5, -1e4)
+        logits_bg_t = (sim_pixel_t / tau_hard).masked_fill(bg_mask < 0.5, -1e4)
+        
+        weights_bg_o = F.softmax(logits_bg_o, dim=-1) * bg_mask
+        weights_bg_o = weights_bg_o / (weights_bg_o.sum(dim=-1, keepdim=True) + 1e-6)
+        weights_bg_t = F.softmax(logits_bg_t, dim=-1) * bg_mask
+        weights_bg_t = weights_bg_t / (weights_bg_t.sum(dim=-1, keepdim=True) + 1e-6)
+        
+        bg_hard_o = torch.einsum('acn,an->ac', feat_o_aug, weights_bg_o)
+        bg_hard_t = torch.einsum('acn,an->ac', feat_t_aug, weights_bg_t)
+        
+        # Lực đẩy từ nền khó (Kết hợp cả chéo và nội tại)
+        neg_hard_o = 0.5 * (torch.exp(ssim(fg_proto_o, bg_hard_t) / tau_p) + torch.exp(ssim(fg_proto_o, bg_hard_o) / tau_p))
+        neg_hard_t = 0.5 * (torch.exp(ssim(fg_proto_t, bg_hard_o) / tau_p) + torch.exp(ssim(fg_proto_t, bg_hard_t) / tau_p))
+        
+        # B. Local Grid 2x2 (Giữ đa dạng vùng)
+        mask_4d = segutils.downsample_mask(mask_base, h, w).unsqueeze(1).float()
+        grid_area = F.adaptive_avg_pool2d(mask_4d, (2, 2))
+        valid_zones = (grid_area > 0.15).float().squeeze(1).view(b, 4)
+        
         local_fg_o = (F.adaptive_avg_pool2d(base * mask_4d, (2, 2)) / (grid_area + 1e-6)).view(b, c, 4)
         local_fg_t = (F.adaptive_avg_pool2d(transformed * mask_4d, (2, 2)) / (grid_area + 1e-6)).view(b, c, 4)
-
-        local_sim = F.cosine_similarity(local_fg_o, local_fg_t, dim=1)            # [b, 4]
+        local_sim = F.cosine_similarity(local_fg_o, local_fg_t, dim=1)
         loss_local = ((1.0 - local_sim) * valid_zones).sum() / (valid_zones.sum() + 1e-6)
-    else:
-        loss_local = 0.0
+
+    # 3. Tổng hợp Symmetric Foreground Loss (Global BG + Hard BG)
+    neg_bg_o = 0.5 * (torch.exp(ssim(fg_proto_o, bg_proto_t) / tau_p) + torch.exp(ssim(fg_proto_o, bg_proto_o) / tau_p))
+    neg_bg_t = 0.5 * (torch.exp(ssim(fg_proto_t, bg_proto_o) / tau_p) + torch.exp(ssim(fg_proto_t, bg_proto_t) / tau_p))
+    
+    loss_fg_o = -torch.log(pos_fg / (pos_fg + neg_bg_o + neg_hard_o))
+    loss_fg_t = -torch.log(pos_fg / (pos_fg + neg_bg_t + neg_hard_t))
+    loss_fg = 0.5 * (loss_fg_o + loss_fg_t).mean()
+
+    # 4. Background Consistency
+    pos_bg = torch.exp(ssim(bg_proto_o, bg_proto_t) / tau_p)
+    neg_bg_cross = 0.5 * (torch.exp(ssim(bg_proto_o, fg_proto_t) / tau_p) + torch.exp(ssim(bg_proto_t, fg_proto_o) / tau_p))
+    loss_bg = -torch.log(pos_bg / (pos_bg + neg_bg_cross)).mean()
 
     return loss_fg + 0.2 * loss_bg + 0.25 * loss_local
 
