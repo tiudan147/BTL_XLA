@@ -20,3 +20,5 @@ logs/
 _demo_exec_test.ipynb
 __pycache__/
 *.pyc
+
+docs/ABCDFSS.md
