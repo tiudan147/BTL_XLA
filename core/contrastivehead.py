@@ -166,20 +166,13 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     b, c, h, w = base.shape
     assert b == k * aug, 'provide correct k and aug such that dim0=k*aug'
 
-    # 1. Global Prototypes
+    # ==========================================
+    # 1. GLOBAL LEVEL (Bức tranh toàn cảnh)
+    # ==========================================
     fg_proto_o, bg_proto_o = augwise_proto(base, mask_base, k, aug)
     fg_proto_t, bg_proto_t = augwise_proto(transformed, mask_transformed, k, aug)
 
-    # ==========================================
-    # CHẤT LIỆU 1: ArcFace Margin (Ép cụm Tiền cảnh siêu chặt)
-    # ==========================================
-    arc_margin = 0.15
-    sim_pos_fg = ssim(fg_proto_o, fg_proto_t)
-    
-    # Chỉ áp dụng Margin khi mô hình đã hội tụ bước đầu (sim > margin) để tránh sụp đổ (collapse)
-    sim_pos_fg_margin = torch.where(sim_pos_fg > arc_margin, sim_pos_fg - arc_margin, sim_pos_fg)
-    pos_fg = torch.exp(sim_pos_fg_margin / tau_p)
-
+    pos_fg = torch.exp(ssim(fg_proto_o, fg_proto_t) / tau_p)
     neg_bg_o = 0.5 * (torch.exp(ssim(fg_proto_o, bg_proto_t) / tau_p) + torch.exp(ssim(fg_proto_o, bg_proto_o) / tau_p))
     neg_bg_t = 0.5 * (torch.exp(ssim(fg_proto_t, bg_proto_o) / tau_p) + torch.exp(ssim(fg_proto_t, bg_proto_t) / tau_p))
     loss_global_fg = 0.5 * (-torch.log(pos_fg / (pos_fg + neg_bg_o)) - torch.log(pos_fg / (pos_fg + neg_bg_t))).mean()
@@ -188,51 +181,78 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     neg_bg_cross = 0.5 * (torch.exp(ssim(bg_proto_o, fg_proto_t) / tau_p) + torch.exp(ssim(bg_proto_t, fg_proto_o) / tau_p))
     loss_global_bg = -torch.log(pos_bg / (pos_bg + neg_bg_cross)).mean()
 
-    # ==========================================
-    # CHẤT LIỆU 2: Covariance/Style Alignment (Căn chỉnh Phương sai)
-    # ==========================================
-    fg_mask_4d = segutils.downsample_mask(mask_base, h, w).unsqueeze(1)
-    
-    base_fg_flat = (base * fg_mask_4d).view(b, c, -1)
-    trans_fg_flat = (transformed * fg_mask_4d).view(b, c, -1)
-    
-    # Tính độ lệch chuẩn (Standard Deviation) dọc theo không gian HxW cho từng kênh
-    std_o = torch.std(base_fg_flat, dim=2)
-    std_t = torch.std(trans_fg_flat, dim=2)
-    
-    # Ép sự biến thiên (phong cách) của ảnh gốc và ảnh biến đổi phải đồng nhất
-    loss_var = F.mse_loss(std_o, std_t)
-
-    # ==========================================
-    # CHẤT LIỆU 3: Damped Dense InfoNCE (Miễn nhiễm nhiễu nhãn Deepglobe)
-    # ==========================================
+    mask_4d = segutils.downsample_mask(mask_base, h, w).unsqueeze(1).float()
     base_norm = F.normalize(base, p=2, dim=1)
     trans_norm = F.normalize(transformed, p=2, dim=1)
-    tau_dense = 0.2
-    
-    dense_pos_sim = (base_norm * trans_norm).sum(dim=1, keepdim=True)
-    dense_pos = torch.exp(dense_pos_sim / tau_dense)
-    
-    bg_o_unsq = F.normalize(bg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
-    bg_t_unsq = F.normalize(bg_proto_t, p=2, dim=-1).view(b, c, 1, 1).detach()
-    
-    dense_neg_o = torch.exp((base_norm * bg_t_unsq).sum(dim=1, keepdim=True) / tau_dense)
-    dense_neg_t = torch.exp((trans_norm * bg_o_unsq).sum(dim=1, keepdim=True) / tau_dense)
-    
-    # Tính xác suất InfoNCE
-    prob_pos = dense_pos / (dense_pos + 0.5 * (dense_neg_o + dense_neg_t) + 1e-6)
-    
-    # Raw Cross Entropy Loss
-    raw_dense_loss = -torch.log(prob_pos + 1e-6)
-    
-    # Huber-style Dampening: Nếu Loss > 2.0 (nghĩa là xác suất < 13% -> Khả năng rất cao là RÁC nhãn)
-    # Ta bẻ cong đồ thị tuyến tính để Gradient không bùng nổ, mô hình lướt qua rác êm ái
-    damped_dense_loss = torch.where(raw_dense_loss > 2.0, 2.0 + 0.1 * (raw_dense_loss - 2.0), raw_dense_loss)
-    
-    loss_dense = (damped_dense_loss * fg_mask_4d).sum() / (fg_mask_4d.sum() + 1e-6)
 
-    # Tỷ lệ tổng hợp: 1.0 (Arc Global FG) + 0.2 (Global BG) + 0.5 (Style/Var) + 0.4 (Damped Dense)
-    return loss_global_fg + 0.2 * loss_global_bg + 0.5 * loss_var + 0.4 * loss_dense
+    loss_grid = 0.0
+    loss_dense = 0.0
+
+    if h >= 20 and w >= 20:
+        # ==========================================
+        # 2. REGIONAL LEVEL (Grid 3x3) - Vũ khí tối thượng bảo vệ Deepglobe
+        # ==========================================
+        grid_size = 3
+        grid_area = F.adaptive_avg_pool2d(mask_4d, (grid_size, grid_size))
+        valid_grid = (grid_area > 0.4).float().squeeze(1).view(b, grid_size * grid_size)
+        
+        local_fg_o = F.normalize(F.adaptive_avg_pool2d(base * mask_4d, (grid_size, grid_size)) / (grid_area + 1e-6), p=2, dim=1).view(b, c, -1)
+        local_fg_t = F.normalize(F.adaptive_avg_pool2d(transformed * mask_4d, (grid_size, grid_size)) / (grid_area + 1e-6), p=2, dim=1).view(b, c, -1)
+        
+        grid_sim = (local_fg_o * local_fg_t).sum(dim=1)
+        loss_grid_pos = ((1.0 - grid_sim) * valid_grid).sum() / (valid_grid.sum() + 1e-6)
+        
+        bg_o_unsq_grid = F.normalize(bg_proto_o, p=2, dim=-1).unsqueeze(-1)
+        bg_t_unsq_grid = F.normalize(bg_proto_t, p=2, dim=-1).unsqueeze(-1)
+        neg_l2g_o = F.relu((local_fg_o * bg_t_unsq_grid).sum(dim=1) - 0.20)
+        neg_l2g_t = F.relu((local_fg_t * bg_o_unsq_grid).sum(dim=1) - 0.20)
+        loss_grid_neg = ((neg_l2g_o + neg_l2g_t) * valid_grid).sum() / (valid_grid.sum() + 1e-6)
+        
+        loss_grid = loss_grid_pos + 0.5 * loss_grid_neg
+
+    # ==========================================
+    # 3. LOCAL LEVEL (Dense InfoNCE + Hard BG) - Lưỡi cưa mài sắc Lung/ISIC/SUIM
+    # ==========================================
+    # Làm mềm mặt nạ để bảo vệ ranh giới (tránh chém đứt mép SUIM/ISIC)
+    soft_mask = mask_4d * torch.clamp(mask_4d - 0.1, min=0.0) 
+    bg_mask = torch.clamp(1.0 - mask_4d, min=0.0, max=1.0)
+    
+    # Tìm Hard BG (Mẫu âm khó nhất)
+    tau_hard = 0.25
+    fg_t_unsq = F.normalize(fg_proto_t, p=2, dim=-1).view(b, c, 1, 1).detach()
+    sim_bg_fg_t = (base_norm * fg_t_unsq).sum(dim=1, keepdim=True)
+    logits_bg_t = (sim_bg_fg_t / tau_hard).masked_fill(bg_mask < 0.1, -1e4)
+    weights_bg_t = F.softmax(logits_bg_t.view(b, -1), dim=-1).view(b, 1, h, w) * bg_mask
+    bg_hard_t = F.normalize((base * weights_bg_t).sum(dim=(2,3)), p=2, dim=1).view(b, c, 1, 1)
+
+    fg_o_unsq = F.normalize(fg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
+    sim_bg_fg_o = (trans_norm * fg_o_unsq).sum(dim=1, keepdim=True)
+    logits_bg_o = (sim_bg_fg_o / tau_hard).masked_fill(bg_mask < 0.1, -1e4)
+    weights_bg_o = F.softmax(logits_bg_o.view(b, -1), dim=-1).view(b, 1, h, w) * bg_mask
+    bg_hard_o = F.normalize((transformed * weights_bg_o).sum(dim=(2,3)), p=2, dim=1).view(b, c, 1, 1)
+
+    # InfoNCE Dày đặc
+    tau_dense = 0.15
+    pos_dense = (base_norm * trans_norm).sum(dim=1, keepdim=True) / tau_dense
+    
+    bg_o_unsq2 = F.normalize(bg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
+    bg_t_unsq2 = F.normalize(bg_proto_t, p=2, dim=-1).view(b, c, 1, 1).detach()
+    
+    neg_bg_o_dense = (base_norm * bg_o_unsq2).sum(dim=1, keepdim=True) / tau_dense
+    neg_bg_t_dense = (base_norm * bg_t_unsq2).sum(dim=1, keepdim=True) / tau_dense
+    neg_hard_o_dense = (base_norm * bg_hard_o).sum(dim=1, keepdim=True) / tau_dense
+    neg_hard_t_dense = (base_norm * bg_hard_t).sum(dim=1, keepdim=True) / tau_dense
+    
+    all_logits = torch.stack([pos_dense, neg_bg_o_dense, neg_bg_t_dense, neg_hard_o_dense, neg_hard_t_dense], dim=-1)
+    lse_all = torch.logsumexp(all_logits, dim=-1)
+    
+    loss_dense_map = lse_all - pos_dense 
+    
+    # Chỉ mài sắc ở lõi Tiền cảnh (nhờ soft_mask)
+    loss_dense = (loss_dense_map * soft_mask).sum() / (soft_mask.sum() + 1e-6)
+
+    # Tỷ lệ Hợp nhất: 1.0 Global FG + 0.2 Global BG + 0.3 Regional Grid + 0.3 Local Dense
+    return loss_global_fg + 0.2 * loss_global_bg + 0.3 * loss_grid + 0.3 * loss_dense
 
 # -------------------hàm Lp ban đầu------------
 # features of base, transformed: [b,c,h,w]
