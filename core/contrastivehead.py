@@ -167,12 +167,14 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     assert b == k * aug, 'provide correct k and aug such that dim0=k*aug'
 
     # ==========================================
-    # 1. TÍNH TOÁN PROTOTYPE TOÀN CỤC (Anchor)
+    # 1. TÍNH TOÁN PROTOTYPE TOÀN CỤC (Anchor tĩnh)
     # ==========================================
     fg_proto_o, bg_proto_o = augwise_proto(base, mask_base, k, aug)
     fg_proto_t, bg_proto_t = augwise_proto(transformed, mask_transformed, k, aug)
 
-    # 2. GLOBAL INFONCE (Duy trì bức tranh tổng thể)
+    # ==========================================
+    # 2. GLOBAL LOSS (Duy trì bức tranh tổng thể)
+    # ==========================================
     pos_fg = torch.exp(ssim(fg_proto_o, fg_proto_t) / tau_p)
     neg_bg_o = 0.5 * (torch.exp(ssim(fg_proto_o, bg_proto_t) / tau_p) + torch.exp(ssim(fg_proto_o, bg_proto_o) / tau_p))
     neg_bg_t = 0.5 * (torch.exp(ssim(fg_proto_t, bg_proto_o) / tau_p) + torch.exp(ssim(fg_proto_t, bg_proto_t) / tau_p))
@@ -183,18 +185,14 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     loss_global_bg = -torch.log(pos_bg / (pos_bg + neg_bg_cross)).mean()
 
     # ==========================================
-    # 3. ROBUST GENERALIZED PIXEL-TO-PROTOTYPE (RG-P2P)
-    # Tự động chống rác nhãn mà không làm mất đạo hàm ranh giới
+    # 3. CONFIDENCE-ADAPTIVE MARGIN P2P (CAM-P2P)
     # ==========================================
     tau_dense = 0.2
-    m_pos = 0.15 
-    m_neg = 0.05 
-    q_param = 0.5  # Siêu tham số GCE (Cân bằng giữa Robustness và Cập nhật Biên)
     
     base_norm = F.normalize(base, p=2, dim=1)
     trans_norm = F.normalize(transformed, p=2, dim=1)
 
-    # Mỏ neo tĩnh (Không cho gradient đi qua để làm mục tiêu chuẩn)
+    # Đóng băng Mỏ neo (Để làm điểm tựa chuẩn mực)
     fg_p_o = F.normalize(fg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
     bg_p_o = F.normalize(bg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
     fg_p_t = F.normalize(fg_proto_t, p=2, dim=-1).view(b, c, 1, 1).detach()
@@ -205,23 +203,41 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     bg_mask_o = torch.clamp(1.0 - soft_mask_o, min=0.0, max=1.0)
     bg_mask_t = torch.clamp(1.0 - soft_mask_t, min=0.0, max=1.0)
 
-    # --- HÀM TÍNH LOSS GCE DÀY ĐẶC (Dense Robust GCE) ---
-    def robust_gce_loss(pixel_feats, pos_anchor, neg_anchor1, neg_anchor2, mask):
-        # Tính khoảng cách Cosine có Margin
-        sim_pos = ((pixel_feats * pos_anchor).sum(dim=1, keepdim=True) - m_pos) / tau_dense
-        sim_neg1 = ((pixel_feats * neg_anchor1).sum(dim=1, keepdim=True) + m_neg) / tau_dense
-        sim_neg2 = ((pixel_feats * neg_anchor2).sum(dim=1, keepdim=True) + m_neg) / tau_dense
+    # --- HÀM TÍNH LOSS VỚI MARGIN ĐỘNG (Dynamic Margin) ---
+    def cam_p2p_loss(feats, p_pos, p_neg1, p_neg2, mask):
+        # Tính độ tương đồng với Tiền cảnh và Hậu cảnh
+        sim_pos = (feats * p_pos).sum(dim=1, keepdim=True)
+        sim_neg1 = (feats * p_neg1).sum(dim=1, keepdim=True)
 
-        # Tính xác suất Pixel thuộc về Positive Anchor (Softmax)
-        logits = torch.stack([sim_pos, sim_neg1, sim_neg2], dim=-1)
-        probs = F.softmax(logits, dim=-1)
-        p_pos = probs[..., 0] # Xác suất mục tiêu
-
-        # Áp dụng công thức Generalized Cross Entropy: (1 - p^q) / q
-        # Nếu q = 0.5, hàm trở thành 2 * (1 - sqrt(p)). Không bao giờ bùng nổ ra vô cực.
-        gce_loss_map = (1.0 - torch.pow(p_pos + 1e-6, q_param)) / q_param
+        # Tính khoảng chênh lệch tự tin (Confidence Diff)
+        # Chỉ lấy phần dương, nếu lấp lửng hoặc nghiêng về sai -> diff = 0
+        diff = torch.clamp(sim_pos.detach() - sim_neg1.detach(), min=0.0)
         
-        return (gce_loss_map * mask).sum() / (mask.sum() + 1e-6)
+        # Scale Margin theo độ tự tin (Vùng lõi margin lớn ~0.15, vùng biên margin = 0)
+        m_pos_dyn = 0.25 * diff
+        m_neg_dyn = 0.10 * diff
+
+        # Áp dụng vào InfoNCE (Không bao giờ triệt tiêu Gradient)
+        pos_logit = (sim_pos - m_pos_dyn) / tau_dense
+        neg_logit_1 = (sim_neg1 + m_neg_dyn) / tau_dense
+        neg_logit_2 = ((feats * p_neg2).sum(dim=1, keepdim=True) + m_neg_dyn) / tau_dense
+
+        lse = torch.logsumexp(torch.stack([pos_logit, neg_logit_1, neg_logit_2], dim=-1), dim=-1)
+        loss_map = lse - pos_logit
+        return (loss_map * mask).sum() / (mask.sum() + 1e-6)
+
+    # --- A. CĂN CHỈNH TỪNG PIXEL TIỀN CẢNH ---
+    loss_fg_o = cam_p2p_loss(base_norm, fg_p_t, bg_p_t, bg_p_o, soft_mask_o)
+    loss_fg_t = cam_p2p_loss(trans_norm, fg_p_o, bg_p_o, bg_p_t, soft_mask_t)
+    loss_dense_fg = 0.5 * (loss_fg_o + loss_fg_t)
+
+    # --- B. CĂN CHỈNH TỪNG PIXEL HẬU CẢNH ---
+    loss_bg_o = cam_p2p_loss(base_norm, bg_p_t, fg_p_t, fg_p_o, bg_mask_o)
+    loss_bg_t = cam_p2p_loss(trans_norm, bg_p_o, fg_p_o, fg_p_t, bg_mask_t)
+    loss_dense_bg = 0.5 * (loss_bg_o + loss_bg_t)
+
+    # Tỷ lệ tổng hợp
+    return loss_global_fg + 0.2 * loss_global_bg + 0.5 * loss_dense_fg + 0.2 * loss_dense_bg
 
     # --- A. CĂN CHỈNH TỪNG PIXEL TIỀN CẢNH ---
     loss_fg_o = robust_gce_loss(base_norm, fg_p_t, bg_p_t, bg_p_o, soft_mask_o)
