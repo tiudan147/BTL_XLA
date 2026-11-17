@@ -181,17 +181,16 @@ def get_grid_prototypes(features, masks, grid_size=(2, 2)):
     
     return prototypes, valid_cells
 
-def grid_contrastive_loss(feat_aug, mask_fg, mask_bg, grid_size=(3, 3), temperature=0.5, margin=0.15, lambda_bg=0.5):
+def grid_contrastive_loss(feat_aug, mask_fg, mask_bg, grid_size=(2, 2), temperature=0.5):
     """
-    The Ultimate Loss:
-    1. Multi-prototype InfoNCE for Foreground (bắt chi tiết phân mảnh với lưới 3x3)
-    2. Hard-Background Margin Penalty (ép sạch nền, chống lem nhem)
+    feat_aug: Đặc trưng ảnh Support sau khi augment [B, C, H, W]
+    mask_fg, mask_bg: Mặt nạ Foreground và Background [B, 1, H, W]
     """
     B, C, H, W = feat_aug.shape
     feat_flat = feat_aug.view(B, C, -1).transpose(1, 2) # [B, H*W, C]
     feat_norm = F.normalize(feat_flat, p=2, dim=-1)
     
-    # 1. Trích xuất đa nguyên mẫu dạng lưới 3x3
+    # 1. Trích xuất đa nguyên mẫu dạng lưới
     protos_fg, valid_fg = get_grid_prototypes(feat_aug, mask_fg, grid_size) # [B, C, K]
     protos_bg, valid_bg = get_grid_prototypes(feat_aug, mask_bg, grid_size)
     
@@ -201,30 +200,24 @@ def grid_contrastive_loss(feat_aug, mask_fg, mask_bg, grid_size=(3, 3), temperat
     protos_fg_norm = F.normalize(protos_fg, p=2, dim=-1)
     protos_bg_norm = F.normalize(protos_bg, p=2, dim=-1)
     
-    # 2. Tính Cosine Similarity chuẩn
-    cos_sim_fg = torch.bmm(feat_norm, protos_fg_norm.transpose(1, 2)) # [B, H*W, K]
-    cos_sim_bg = torch.bmm(feat_norm, protos_bg_norm.transpose(1, 2)) # [B, H*W, K]
+    # 2. Tính Cosine Similarity giữa từng pixel và tất cả các nguyên mẫu cục bộ
+    sim_fg = torch.bmm(feat_norm, protos_fg_norm.transpose(1, 2)) / temperature # [B, H*W, K]
+    sim_bg = torch.bmm(feat_norm, protos_bg_norm.transpose(1, 2)) / temperature
     
-    # Loại bỏ các ô lưới rỗng
-    cos_sim_fg = cos_sim_fg.masked_fill(~valid_fg.unsqueeze(1), -1e4)
-    cos_sim_bg = cos_sim_bg.masked_fill(~valid_bg.unsqueeze(1), -1e4)
+    # Loại bỏ các ô lưới rỗng (không có pixel đối tượng) để tránh chọn nhầm
+    sim_fg = sim_fg.masked_fill(~valid_fg.unsqueeze(1), -1e4)
+    sim_bg = sim_bg.masked_fill(~valid_bg.unsqueeze(1), -1e4)
     
-    # 3. Chọn nguyên mẫu gần nhất
-    raw_max_sim_fg, _ = torch.max(cos_sim_fg, dim=-1) # [B, H*W]
-    raw_max_sim_bg, _ = torch.max(cos_sim_bg, dim=-1) # [B, H*W]
+    # 3. Chọn nguyên mẫu gần nhất (Hard-selection qua Max)
+    max_sim_fg, _ = torch.max(sim_fg, dim=-1) # [B, H*W]
+    max_sim_bg, _ = torch.max(sim_bg, dim=-1) # [B, H*W]
     
-    # 4. InfoNCE Loss trên Foreground
-    logits = torch.cat([(raw_max_sim_fg / temperature).unsqueeze(-1), 
-                        (raw_max_sim_bg / temperature).unsqueeze(-1)], dim=-1) # [B, H*W, 2]
+    # 4. InfoNCE Loss trên từng pixel foreground
+    logits = torch.cat([max_sim_fg.unsqueeze(-1), max_sim_bg.unsqueeze(-1)], dim=-1) # [B, H*W, 2]
     target_mask = mask_fg.view(B, -1)
-    loss_fg = (-F.log_softmax(logits, dim=-1)[..., 0] * target_mask).sum() / (target_mask.sum() + 1e-6)
     
-    # 5. Hard-Background Margin Loss
-    bg_flat = mask_bg.view(B, -1)
-    hard_bg_penalty = F.relu(raw_max_sim_fg - margin) * bg_flat
-    loss_bg_margin = hard_bg_penalty.sum() / (bg_flat.sum() + 1e-6)
-    
-    return loss_fg + lambda_bg * loss_bg_margin
+    loss_fg = -F.log_softmax(logits, dim=-1)[..., 0] * target_mask
+    return loss_fg.sum() / (target_mask.sum() + 1e-6)
 
 #------------------------------------------------
 #            Nơi định nghĩa hàm loss Lp
@@ -530,17 +523,17 @@ class ContrastiveFeatureTransformer(nn.Module):
             # 3. do not let only one image fit well - regularization
             q_s_loss_diff = torch.abs(qloss - sloss) if config_fit.symmetricloss else 0
 
-            # 4. The Ultimate Loss (Đa nguyên mẫu 3x3 + Hard-Background Margin Penalty)
+            # 4. Grid Contrastive Loss (Đa nguyên mẫu cục bộ 2x2 khắc phục lỗ hổng GAP)
             s_mask_4d = augmented_smasks.unsqueeze(1).float()
             mask_fg = (s_mask_4d > 0.5).float()
             mask_bg = 1.0 - mask_fg
-            loss_grid = grid_contrastive_loss(transformed_features, mask_fg, mask_bg, grid_size=(3, 3), margin=0.15, lambda_bg=0.5)
+            loss_grid = grid_contrastive_loss(transformed_features, mask_fg, mask_bg, grid_size=(2, 2))
 
 #------------------------------------------------
 #            Nơi tổng hợp loss
 #------------------------------------------------
 
-            # Aggregate loss: sử dụng The Ultimate Loss lai tạo thay thế proto_loss toàn cục
+            # Aggregate loss: sử dụng loss_grid đa nguyên mẫu thay thế proto_loss toàn cục
             loss = qloss + sloss + q_s_loss_diff + (1.5 * loss_grid)
             
             assert loss.isfinite().all(), f"invalid contrastive loss:{loss}"
