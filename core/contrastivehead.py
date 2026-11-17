@@ -171,11 +171,12 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     assert b == k * aug, 'provide correct k and aug such that dim0=k*aug'
 
     # ==========================================
-    # 1. PROTOTYPE TOÀN CỤC & GLOBAL LOSS
+    # 1. TÍNH TOÁN PROTOTYPE TOÀN CỤC
     # ==========================================
     fg_proto_o, bg_proto_o = augwise_proto(base, mask_base, k, aug)
     fg_proto_t, bg_proto_t = augwise_proto(transformed, mask_transformed, k, aug)
 
+    # 2. GLOBAL LOSS (Neo giữ ngữ nghĩa vĩ mô)
     pos_fg = torch.exp(ssim(fg_proto_o, fg_proto_t) / tau_p)
     neg_bg_o = 0.5 * (torch.exp(ssim(fg_proto_o, bg_proto_t) / tau_p) + torch.exp(ssim(fg_proto_o, bg_proto_o) / tau_p))
     neg_bg_t = 0.5 * (torch.exp(ssim(fg_proto_t, bg_proto_o) / tau_p) + torch.exp(ssim(fg_proto_t, bg_proto_t) / tau_p))
@@ -185,20 +186,21 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     neg_bg_cross = 0.5 * (torch.exp(ssim(bg_proto_o, fg_proto_t) / tau_p) + torch.exp(ssim(bg_proto_t, fg_proto_o) / tau_p))
     loss_global_bg = -torch.log(pos_bg / (pos_bg + neg_bg_cross)).mean()
 
-    # TRỰC GIAO HÓA (Xương sống vĩ mô bảo vệ SUIM)
+    # 3. ORTHOGONAL PENALTY (Vũ khí tạo sự phân tách hình học tuyệt đối)
     loss_ortho = 0.5 * (F.relu(ssim(fg_proto_o, bg_proto_o)) + F.relu(ssim(fg_proto_t, bg_proto_t))).mean()
 
     # ==========================================
-    # 2. LABEL-SMOOTHED MARGIN PIXEL-TO-PROTOTYPE (Đột phá V35)
+    # 4. MARGIN PIXEL-TO-PROTOTYPE (Lưỡi dao mài viền thuần túy)
+    # KHÔNG Gate, KHÔNG Pooling, KHÔNG Smoothing. Chỉ có Toán học Không gian!
     # ==========================================
     tau_dense = 0.2
     m_pos = 0.15 
     m_neg = 0.05 
-    alpha = 0.1 # Label Smoothing (Cho phép 10% linh hoạt để dung nạp ranh giới mềm và rác nhãn)
     
     base_norm = F.normalize(base, p=2, dim=1)
     trans_norm = F.normalize(transformed, p=2, dim=1)
 
+    # Đóng băng Mỏ neo (Trạm hải đăng tĩnh)
     fg_p_o = F.normalize(fg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
     bg_p_o = F.normalize(bg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
     fg_p_t = F.normalize(fg_proto_t, p=2, dim=-1).view(b, c, 1, 1).detach()
@@ -209,35 +211,36 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     bg_mask_o = torch.clamp(1.0 - soft_mask_o, min=0.0, max=1.0)
     bg_mask_t = torch.clamp(1.0 - soft_mask_t, min=0.0, max=1.0)
 
-    # --- HÀM TÍNH LOSS INFO-NCE LÀM MỀM NHÃN (Label Smoothed InfoNCE) ---
-    def label_smoothed_p2p_loss(feats, p_pos_anchor, p_neg_anchor1, p_neg_anchor2, mask):
-        # Tính Logits có Margin như bản vĩ đại V21
-        pos_logit = ((feats * p_pos_anchor).sum(dim=1, keepdim=True) - m_pos) / tau_dense
-        neg_logit_1 = ((feats * p_neg_anchor1).sum(dim=1, keepdim=True) + m_neg) / tau_dense
-        neg_logit_2 = ((feats * p_neg_anchor2).sum(dim=1, keepdim=True) + m_neg) / tau_dense
-        
-        lse = torch.logsumexp(torch.stack([pos_logit, neg_logit_1, neg_logit_2], dim=-1), dim=-1)
-        
-        # Công thức Label Smoothing thuần túy: Không dùng if/else, không dùng pooling
-        # Mục tiêu Tiền cảnh (1 - alpha), Mục tiêu Hậu cảnh (alpha / 2)
-        loss_map = (1.0 - alpha) * (lse - pos_logit) + \
-                   (alpha / 2.0) * (lse - neg_logit_1) + \
-                   (alpha / 2.0) * (lse - neg_logit_2)
-                   
-        return (loss_map * mask).sum() / (mask.sum() + 1e-6)
-
     # --- A. CĂN CHỈNH TỪNG PIXEL TIỀN CẢNH ---
-    loss_fg_o = label_smoothed_p2p_loss(base_norm, fg_p_t, bg_p_t, bg_p_o, soft_mask_o)
-    loss_fg_t = label_smoothed_p2p_loss(trans_norm, fg_p_o, bg_p_o, bg_p_t, soft_mask_t)
-    loss_dense_fg = 0.5 * (loss_fg_o + loss_fg_t)
+    pos_fg_o = ((base_norm * fg_p_t).sum(dim=1, keepdim=True) - m_pos) / tau_dense
+    neg_fg_o_1 = ((base_norm * bg_p_t).sum(dim=1, keepdim=True) + m_neg) / tau_dense
+    neg_fg_o_2 = ((base_norm * bg_p_o).sum(dim=1, keepdim=True) + m_neg) / tau_dense
+    loss_fg_map_o = torch.logsumexp(torch.stack([pos_fg_o, neg_fg_o_1, neg_fg_o_2], dim=-1), dim=-1) - pos_fg_o
+
+    pos_fg_t = ((trans_norm * fg_p_o).sum(dim=1, keepdim=True) - m_pos) / tau_dense
+    neg_fg_t_1 = ((trans_norm * bg_p_o).sum(dim=1, keepdim=True) + m_neg) / tau_dense
+    neg_fg_t_2 = ((trans_norm * bg_p_t).sum(dim=1, keepdim=True) + m_neg) / tau_dense
+    loss_fg_map_t = torch.logsumexp(torch.stack([pos_fg_t, neg_fg_t_1, neg_fg_t_2], dim=-1), dim=-1) - pos_fg_t
+
+    loss_dense_fg = 0.5 * ((loss_fg_map_o * soft_mask_o).sum() / (soft_mask_o.sum() + 1e-6) +
+                           (loss_fg_map_t * soft_mask_t).sum() / (soft_mask_t.sum() + 1e-6))
 
     # --- B. CĂN CHỈNH TỪNG PIXEL HẬU CẢNH ---
-    loss_bg_o = label_smoothed_p2p_loss(base_norm, bg_p_t, fg_p_t, fg_p_o, bg_mask_o)
-    loss_bg_t = label_smoothed_p2p_loss(trans_norm, bg_p_o, fg_p_o, fg_p_t, bg_mask_t)
-    loss_dense_bg = 0.5 * (loss_bg_o + loss_bg_t)
+    pos_bg_o = ((base_norm * bg_p_t).sum(dim=1, keepdim=True) - m_pos) / tau_dense
+    neg_bg_o_1 = ((base_norm * fg_p_t).sum(dim=1, keepdim=True) + m_neg) / tau_dense
+    neg_bg_o_2 = ((base_norm * fg_p_o).sum(dim=1, keepdim=True) + m_neg) / tau_dense
+    loss_bg_map_o = torch.logsumexp(torch.stack([pos_bg_o, neg_bg_o_1, neg_bg_o_2], dim=-1), dim=-1) - pos_bg_o
 
-    # Tỷ lệ tổng hợp
-    return loss_global_fg + 0.2 * loss_global_bg + 0.2 * loss_ortho + 0.5 * loss_dense_fg + 0.2 * loss_dense_bg
+    pos_bg_t = ((trans_norm * bg_p_o).sum(dim=1, keepdim=True) - m_pos) / tau_dense
+    neg_bg_t_1 = ((trans_norm * fg_p_o).sum(dim=1, keepdim=True) + m_neg) / tau_dense
+    neg_bg_t_2 = ((trans_norm * fg_p_t).sum(dim=1, keepdim=True) + m_neg) / tau_dense
+    loss_bg_map_t = torch.logsumexp(torch.stack([pos_bg_t, neg_bg_t_1, neg_bg_t_2], dim=-1), dim=-1) - pos_bg_t
+
+    loss_dense_bg = 0.5 * ((loss_bg_map_o * bg_mask_o).sum() / (bg_mask_o.sum() + 1e-6) +
+                           (loss_bg_map_t * bg_mask_t).sum() / (bg_mask_t.sum() + 1e-6))
+
+    # Tỷ lệ tổng hợp: 0.5 Ortho để bảo vệ không gian tuyệt đối
+    return loss_global_fg + 0.2 * loss_global_bg + 0.5 * loss_ortho + 0.5 * loss_dense_fg + 0.2 * loss_dense_bg
 
 # -------------------hàm Lp ban đầu------------
 # features of base, transformed: [b,c,h,w]
