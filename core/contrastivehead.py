@@ -211,7 +211,42 @@ def keep_var_loss(original_features, transformed_features):
         vardiff).mean()  # [k*aug,c] -> [scalar] or  [aug,c] -> [scalar]
     return keepvarloss
 
+#-----------------------------------------------------
+#         Đổi loss lần 2
+#---------------------------------------------------------
 
+class EnhancedAdaptationLoss(nn.Module):
+    def __init__(self, margin=0.15, lambda_ortho=0.5, lambda_bg=0.5):
+        super().__init__()
+        self.margin = margin
+        self.lambda_ortho = lambda_ortho
+        self.lambda_bg = lambda_bg
+    def forward(self, feat_map, support_mask):
+        """
+        feat_map: Tensor đặc trưng [B, C, H, W]
+        support_mask: Mặt nạ nhị phân [B, H, W] hoặc [B, 1, H, W]
+        """
+        if support_mask.dim() == 3:
+            support_mask = support_mask.unsqueeze(1)
+        # Chuẩn hóa L2 đặc trưng theo chiều kênh
+        feat_norm = F.normalize(feat_map, p=2, dim=1)
+        
+        fg_mask = (support_mask > 0.5).float()
+        bg_mask = 1.0 - fg_mask
+        # Tính Prototype tiền cảnh (P_fg) và hậu cảnh (P_bg)
+        fg_sum = (feat_norm * fg_mask).sum(dim=(2, 3))
+        bg_sum = (feat_norm * bg_mask).sum(dim=(2, 3))
+        
+        p_fg = F.normalize(fg_sum / (fg_mask.sum(dim=(2, 3)) + 1e-6), p=2, dim=1)
+        p_bg = F.normalize(bg_sum / (bg_mask.sum(dim=(2, 3)) + 1e-6), p=2, dim=1)
+        # 1. Orthogonality Loss: Ép P_fg và P_bg tách biệt (cosine <= 0)
+        cos_fg_bg = (p_fg * p_bg).sum(dim=1)
+        loss_ortho = F.relu(cos_fg_bg).mean()
+        # 2. Hard-Background Margin Loss: Đẩy các pixel nền dễ nhầm lẫn ra xa P_fg
+        sim_to_fg = (feat_norm * p_fg.unsqueeze(-1).unsqueeze(-1)).sum(dim=1, keepdim=True)
+        hard_bg_penalty = F.relu(sim_to_fg - self.margin) * bg_mask
+        loss_bg_margin = hard_bg_penalty.sum() / (bg_mask.sum() + 1e-6)
+        return self.lambda_ortho * loss_ortho + self.lambda_bg * loss_bg_margin
 
 #-----------------------------------------------------
 #         Vị trí mạng adapter
@@ -472,7 +507,13 @@ class ContrastiveFeatureTransformer(nn.Module):
             # Aggregate loss
             # loss = qloss + sloss + q_s_loss_diff + proto_loss
 
-            loss = qloss + sloss + q_s_loss_diff + (1.5 * proto_loss) # loss giúp tăng cho lung
+            # loss = qloss + sloss + q_s_loss_diff + (1.5 * proto_loss) # loss giúp tăng cho lung
+
+            # Tính thêm Enhanced Adaptation Loss (Orthogonality + Hard-Background Margin)
+            loss_enhanced = self.enhanced_loss_fn(transformed_features, augmented_smasks)
+            # Cập nhật tổng Loss
+            loss = qloss + sloss + q_s_loss_diff + (1.5 * proto_loss) + loss_enhanced
+            
             assert loss.isfinite().all(), f"invalid contrastive loss:{loss}"
 
             # Backpropagation and optimization
