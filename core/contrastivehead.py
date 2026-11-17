@@ -173,30 +173,39 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     fg_proto_t, bg_proto_t = augwise_proto(transformed, mask_transformed, k, aug)
 
     # ==========================================
-    # 2. GLOBAL LOSS & ORTHOGONAL (Bảo vệ không gian vĩ mô)
-    # Chỉ ép FG đồng nhất chéo. Hậu cảnh được tự do!
+    # 2. GLOBAL INFONCE SỬA LỖI (Chuẩn hóa Softmax Mẫu số chung)
     # ==========================================
-    pos_fg = torch.exp(ssim(fg_proto_o, fg_proto_t) / tau_p)
-    neg_bg_o = 0.5 * (torch.exp(ssim(fg_proto_o, bg_proto_t) / tau_p) + torch.exp(ssim(fg_proto_o, bg_proto_o) / tau_p))
-    neg_bg_t = 0.5 * (torch.exp(ssim(fg_proto_t, bg_proto_o) / tau_p) + torch.exp(ssim(fg_proto_t, bg_proto_t) / tau_p))
-    loss_global_fg = 0.5 * (-torch.log(pos_fg / (pos_fg + neg_bg_o)) - torch.log(pos_fg / (pos_fg + neg_bg_t))).mean()
+    # Ảnh gốc làm mỏ neo
+    pos_fg_o = torch.exp(ssim(fg_proto_o, fg_proto_t) / tau_p)
+    neg_bg_intra_o = torch.exp(ssim(fg_proto_o, bg_proto_o) / tau_p)
+    neg_bg_cross_o = torch.exp(ssim(fg_proto_o, bg_proto_t) / tau_p)
+    loss_global_fg_o = -torch.log(pos_fg_o / (pos_fg_o + neg_bg_intra_o + neg_bg_cross_o)).mean()
 
-    # FG và BG của CÙNG một ảnh phải trực giao (Vuông góc tuyệt đối)
-    loss_ortho = 0.5 * (F.relu(ssim(fg_proto_o, bg_proto_o)) + F.relu(ssim(fg_proto_t, bg_proto_t))).mean()
+    # Ảnh biến đổi làm mỏ neo
+    pos_fg_t = torch.exp(ssim(fg_proto_t, fg_proto_o) / tau_p)
+    neg_bg_intra_t = torch.exp(ssim(fg_proto_t, bg_proto_t) / tau_p)
+    neg_bg_cross_t = torch.exp(ssim(fg_proto_t, bg_proto_o) / tau_p)
+    loss_global_fg_t = -torch.log(pos_fg_t / (pos_fg_t + neg_bg_intra_t + neg_bg_cross_t)).mean()
+
+    loss_global = 0.5 * (loss_global_fg_o + loss_global_fg_t)
 
     # ==========================================
-    # 3. POLY-CONTRASTIVE DENSE P2P (Lưỡi dao Toán học PolyLoss)
-    # Tốc độ siêu nhanh, không mảng phụ, không BMM
+    # 3. DECOUPLED ASYMMETRIC DENSE P2P (Khắc phục Scale Imbalance & Feature Drift)
     # ==========================================
     tau_dense = 0.2
-    m_pos = 0.15 
-    m_neg = 0.05 
-    epsilon = 1.0 # Trọng số Poly-1 (Bơm gradient sống còn cho ranh giới)
     
+    # FG: Hội tụ khắt khe (Cross-view)
+    fg_m_pos = 0.15
+    fg_m_neg = 0.05
+    
+    # BG: Co cụm lỏng lẻo cục bộ (Intra-view), Đẩy lùi kịch liệt FG
+    bg_m_pos = 0.05
+    bg_m_neg = 0.15
+
     base_norm = F.normalize(base, p=2, dim=1)
     trans_norm = F.normalize(transformed, p=2, dim=1)
 
-    # Đóng băng mỏ neo
+    # Đóng băng Mỏ neo
     fg_p_o = F.normalize(fg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
     bg_p_o = F.normalize(bg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
     fg_p_t = F.normalize(fg_proto_t, p=2, dim=-1).view(b, c, 1, 1).detach()
@@ -207,36 +216,38 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     bg_mask_o = torch.clamp(1.0 - soft_mask_o, min=0.0, max=1.0)
     bg_mask_t = torch.clamp(1.0 - soft_mask_t, min=0.0, max=1.0)
 
-    # --- HÀM INFO-NCE TÍCH HỢP ĐA THỨC POLY-LOSS ---
-    def poly_infonce(feats, p_pos, p_neg1, p_neg2, mask):
-        pos_logit = ((feats * p_pos).sum(dim=1, keepdim=True) - m_pos) / tau_dense
-        neg_logit1 = ((feats * p_neg1).sum(dim=1, keepdim=True) + m_neg) / tau_dense
-        neg_logit2 = ((feats * p_neg2).sum(dim=1, keepdim=True) + m_neg) / tau_dense
-        
-        # Cross Entropy truyền thống (InfoNCE)
-        lse = torch.logsumexp(torch.stack([pos_logit, neg_logit1, neg_logit2], dim=-1), dim=-1)
-        ce_loss = lse - pos_logit
-        
-        # Poly-1 Expansion: epsilon * (1 - P_target)
-        p_target = torch.exp(-ce_loss)
-        poly_loss = ce_loss + epsilon * (1.0 - p_target)
-        
-        return (poly_loss * mask).sum() / (mask.sum() + 1e-6)
+    # --- A. PIXEL TIỀN CẢNH: KÉO CHÉO (CROSS-VIEW PULL) ---
+    # Mục tiêu dương là FG ảnh đối diện
+    pos_fg_o = ((base_norm * fg_p_t).sum(dim=1, keepdim=True) - fg_m_pos) / tau_dense
+    neg_fg_o_1 = ((base_norm * bg_p_t).sum(dim=1, keepdim=True) + fg_m_neg) / tau_dense
+    neg_fg_o_2 = ((base_norm * bg_p_o).sum(dim=1, keepdim=True) + fg_m_neg) / tau_dense
+    loss_fg_map_o = torch.logsumexp(torch.stack([pos_fg_o, neg_fg_o_1, neg_fg_o_2], dim=-1), dim=-1) - pos_fg_o
 
-    # --- A. CĂN CHỈNH TIỀN CẢNH (CROSS-VIEW PULL) ---
-    # Ép pixel về Mỏ neo của ảnh BIẾN ĐỔI chéo (Bảo tồn tính bất biến)
-    loss_fg_o = poly_infonce(base_norm, fg_p_t, bg_p_t, bg_p_o, soft_mask_o)
-    loss_fg_t = poly_infonce(trans_norm, fg_p_o, bg_p_o, bg_p_t, soft_mask_t)
-    loss_dense_fg = 0.5 * (loss_fg_o + loss_fg_t)
+    pos_fg_t = ((trans_norm * fg_p_o).sum(dim=1, keepdim=True) - fg_m_pos) / tau_dense
+    neg_fg_t_1 = ((trans_norm * bg_p_o).sum(dim=1, keepdim=True) + fg_m_neg) / tau_dense
+    neg_fg_t_2 = ((trans_norm * bg_p_t).sum(dim=1, keepdim=True) + fg_m_neg) / tau_dense
+    loss_fg_map_t = torch.logsumexp(torch.stack([pos_fg_t, neg_fg_t_1, neg_fg_t_2], dim=-1), dim=-1) - pos_fg_t
 
-    # --- B. CĂN CHỈNH HẬU CẢNH (INTRA-VIEW PULL) ---
-    # Đỉnh cao Logic: Nền ảnh nào thì gom về Mỏ neo ảnh đó, KHÔNG bắt chéo ép uổng!
-    loss_bg_o = poly_infonce(base_norm, bg_p_o, fg_p_o, fg_p_t, bg_mask_o)
-    loss_bg_t = poly_infonce(trans_norm, bg_p_t, fg_p_t, fg_p_o, bg_mask_t)
-    loss_dense_bg = 0.5 * (loss_bg_o + loss_bg_t)
+    loss_dense_fg = 0.5 * ((loss_fg_map_o * soft_mask_o).sum() / (soft_mask_o.sum() + 1e-6) + 
+                           (loss_fg_map_t * soft_mask_t).sum() / (soft_mask_t.sum() + 1e-6))
 
-    # Tỷ lệ tổng hợp
-    return loss_global_fg + 0.5 * loss_ortho + 0.5 * loss_dense_fg + 0.2 * loss_dense_bg
+    # --- B. PIXEL HẬU CẢNH: KÉO CỤC BỘ (INTRA-VIEW PULL) ---
+    # MỤC TIÊU DƯƠNG LÀ BG ẢNH CỦA CHÍNH NÓ (Bảo toàn Local Smoothness, Giải quyết Multi-modal)
+    pos_bg_o = ((base_norm * bg_p_o).sum(dim=1, keepdim=True) - bg_m_pos) / tau_dense
+    neg_bg_o_1 = ((base_norm * fg_p_o).sum(dim=1, keepdim=True) + bg_m_neg) / tau_dense
+    neg_bg_o_2 = ((base_norm * fg_p_t).sum(dim=1, keepdim=True) + bg_m_neg) / tau_dense
+    loss_bg_map_o = torch.logsumexp(torch.stack([pos_bg_o, neg_bg_o_1, neg_bg_o_2], dim=-1), dim=-1) - pos_bg_o
+
+    pos_bg_t = ((trans_norm * bg_p_t).sum(dim=1, keepdim=True) - bg_m_pos) / tau_dense
+    neg_bg_t_1 = ((trans_norm * fg_p_t).sum(dim=1, keepdim=True) + bg_m_neg) / tau_dense
+    neg_bg_t_2 = ((trans_norm * fg_p_o).sum(dim=1, keepdim=True) + bg_m_neg) / tau_dense
+    loss_bg_map_t = torch.logsumexp(torch.stack([pos_bg_t, neg_bg_t_1, neg_bg_t_2], dim=-1), dim=-1) - pos_bg_t
+
+    loss_dense_bg = 0.5 * ((loss_bg_map_o * bg_mask_o).sum() / (bg_mask_o.sum() + 1e-6) +
+                           (loss_bg_map_t * bg_mask_t).sum() / (bg_mask_t.sum() + 1e-6))
+
+    # Tỷ lệ tổng hợp: Trả lại trọng số cân bằng chuẩn mực
+    return loss_global + 1.0 * loss_dense_fg + 0.5 * loss_dense_bg
 
 # -------------------hàm Lp ban đầu------------
 # features of base, transformed: [b,c,h,w]
