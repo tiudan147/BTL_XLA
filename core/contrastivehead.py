@@ -167,7 +167,7 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     assert b == k * aug, 'provide correct k and aug such that dim0=k*aug'
 
     # ==========================================
-    # 1. GLOBAL LEVEL (Bức tranh toàn cảnh)
+    # 1. GLOBAL LEVEL
     # ==========================================
     fg_proto_o, bg_proto_o = augwise_proto(base, mask_base, k, aug)
     fg_proto_t, bg_proto_t = augwise_proto(transformed, mask_transformed, k, aug)
@@ -186,11 +186,10 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     trans_norm = F.normalize(transformed, p=2, dim=1)
 
     loss_grid = 0.0
-    loss_dense = 0.0
 
     if h >= 20 and w >= 20:
         # ==========================================
-        # 2. REGIONAL LEVEL (Grid 3x3) - Vũ khí tối thượng bảo vệ Deepglobe
+        # 2. REGIONAL LEVEL (Grid 3x3) - "Xương sống" của Deepglobe
         # ==========================================
         grid_size = 3
         grid_area = F.adaptive_avg_pool2d(mask_4d, (grid_size, grid_size))
@@ -211,24 +210,28 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
         loss_grid = loss_grid_pos + 0.5 * loss_grid_neg
 
     # ==========================================
-    # 3. LOCAL LEVEL (Dense InfoNCE + Hard BG) - Lưỡi cưa mài sắc Lung/ISIC/SUIM
+    # 3. LOCAL LEVEL (Dense InfoNCE) - "Lưỡi cưa" của Lung/ISIC/SUIM
     # ==========================================
-    # Làm mềm mặt nạ để bảo vệ ranh giới (tránh chém đứt mép SUIM/ISIC)
-    soft_mask = mask_4d * torch.clamp(mask_4d - 0.1, min=0.0) 
-    bg_mask = torch.clamp(1.0 - mask_4d, min=0.0, max=1.0)
     
-    # Tìm Hard BG (Mẫu âm khó nhất)
+    # CHIẾN THUẬT V18: Scale-Aware Masking (Bảo vệ tuyệt đối vật thể nhỏ như SUIM)
+    fg_area = mask_4d.sum(dim=(2,3), keepdim=True)
+    # Nếu diện tích FG < 25 pixels, không gọt biên. Ngược lại, gọt 0.1 để mài sắc.
+    soft_mask = torch.where(fg_area < 25, mask_4d, mask_4d * torch.clamp(mask_4d - 0.1, min=0.0))
+    
+    # Strict Hard BG: Chỉ lấy Hard BG ở vùng hoàn toàn là nền (mask < 0.5) để né rác ranh giới
+    strict_bg_mask = (mask_4d < 0.5).float()
     tau_hard = 0.25
+    
     fg_t_unsq = F.normalize(fg_proto_t, p=2, dim=-1).view(b, c, 1, 1).detach()
     sim_bg_fg_t = (base_norm * fg_t_unsq).sum(dim=1, keepdim=True)
-    logits_bg_t = (sim_bg_fg_t / tau_hard).masked_fill(bg_mask < 0.1, -1e4)
-    weights_bg_t = F.softmax(logits_bg_t.view(b, -1), dim=-1).view(b, 1, h, w) * bg_mask
+    logits_bg_t = (sim_bg_fg_t / tau_hard).masked_fill(strict_bg_mask == 0, -1e4)
+    weights_bg_t = F.softmax(logits_bg_t.view(b, -1), dim=-1).view(b, 1, h, w) * strict_bg_mask
     bg_hard_t = F.normalize((base * weights_bg_t).sum(dim=(2,3)), p=2, dim=1).view(b, c, 1, 1)
 
     fg_o_unsq = F.normalize(fg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
     sim_bg_fg_o = (trans_norm * fg_o_unsq).sum(dim=1, keepdim=True)
-    logits_bg_o = (sim_bg_fg_o / tau_hard).masked_fill(bg_mask < 0.1, -1e4)
-    weights_bg_o = F.softmax(logits_bg_o.view(b, -1), dim=-1).view(b, 1, h, w) * bg_mask
+    logits_bg_o = (sim_bg_fg_o / tau_hard).masked_fill(strict_bg_mask == 0, -1e4)
+    weights_bg_o = F.softmax(logits_bg_o.view(b, -1), dim=-1).view(b, 1, h, w) * strict_bg_mask
     bg_hard_o = F.normalize((transformed * weights_bg_o).sum(dim=(2,3)), p=2, dim=1).view(b, c, 1, 1)
 
     # InfoNCE Dày đặc
@@ -248,11 +251,11 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     
     loss_dense_map = lse_all - pos_dense 
     
-    # Chỉ mài sắc ở lõi Tiền cảnh (nhờ soft_mask)
+    # Áp dụng soft_mask thông minh
     loss_dense = (loss_dense_map * soft_mask).sum() / (soft_mask.sum() + 1e-6)
 
-    # Tỷ lệ Hợp nhất: 1.0 Global FG + 0.2 Global BG + 0.3 Regional Grid + 0.3 Local Dense
-    return loss_global_fg + 0.2 * loss_global_bg + 0.3 * loss_grid + 0.3 * loss_dense
+    # Tỷ lệ: 1.0 Global FG + 0.2 Global BG + 0.3 Grid (Giữ Deepglobe) + 0.35 Dense (Đẩy ISIC/SUIM)
+    return loss_global_fg + 0.2 * loss_global_bg + 0.3 * loss_grid + 0.35 * loss_dense
 
 # -------------------hàm Lp ban đầu------------
 # features of base, transformed: [b,c,h,w]
