@@ -167,14 +167,11 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     assert b == k * aug, 'provide correct k and aug such that dim0=k*aug'
 
     # ==========================================
-    # 1. TÍNH TOÁN PROTOTYPE TOÀN CỤC (Anchor tĩnh)
+    # 1. TÍNH TOÁN PROTOTYPE TOÀN CỤC & GLOBAL LOSS
     # ==========================================
     fg_proto_o, bg_proto_o = augwise_proto(base, mask_base, k, aug)
     fg_proto_t, bg_proto_t = augwise_proto(transformed, mask_transformed, k, aug)
 
-    # ==========================================
-    # 2. GLOBAL LOSS (Duy trì bức tranh tổng thể)
-    # ==========================================
     pos_fg = torch.exp(ssim(fg_proto_o, fg_proto_t) / tau_p)
     neg_bg_o = 0.5 * (torch.exp(ssim(fg_proto_o, bg_proto_t) / tau_p) + torch.exp(ssim(fg_proto_o, bg_proto_o) / tau_p))
     neg_bg_t = 0.5 * (torch.exp(ssim(fg_proto_t, bg_proto_o) / tau_p) + torch.exp(ssim(fg_proto_t, bg_proto_t) / tau_p))
@@ -185,14 +182,11 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     loss_global_bg = -torch.log(pos_bg / (pos_bg + neg_bg_cross)).mean()
 
     # ==========================================
-    # 3. CONFIDENCE-ADAPTIVE MARGIN P2P (CAM-P2P)
+    # 2. DYNAMIC TEMPERATURE & MARGIN P2P (DTAM-P2P)
     # ==========================================
-    tau_dense = 0.2
-    
     base_norm = F.normalize(base, p=2, dim=1)
     trans_norm = F.normalize(transformed, p=2, dim=1)
 
-    # Đóng băng Mỏ neo (Để làm điểm tựa chuẩn mực)
     fg_p_o = F.normalize(fg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
     bg_p_o = F.normalize(bg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
     fg_p_t = F.normalize(fg_proto_t, p=2, dim=-1).view(b, c, 1, 1).detach()
@@ -203,53 +197,43 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     bg_mask_o = torch.clamp(1.0 - soft_mask_o, min=0.0, max=1.0)
     bg_mask_t = torch.clamp(1.0 - soft_mask_t, min=0.0, max=1.0)
 
-    # --- HÀM TÍNH LOSS VỚI MARGIN ĐỘNG (Dynamic Margin) ---
-    def cam_p2p_loss(feats, p_pos, p_neg1, p_neg2, mask):
-        # Tính độ tương đồng với Tiền cảnh và Hậu cảnh
+    # --- HÀM TÍNH LOSS VỚI NHIỆT ĐỘ & MARGIN ĐỘNG ---
+    def dtam_p2p_loss(feats, p_pos, p_neg1, p_neg2, mask):
         sim_pos = (feats * p_pos).sum(dim=1, keepdim=True)
         sim_neg1 = (feats * p_neg1).sum(dim=1, keepdim=True)
 
-        # Tính khoảng chênh lệch tự tin (Confidence Diff)
-        # Chỉ lấy phần dương, nếu lấp lửng hoặc nghiêng về sai -> diff = 0
-        diff = torch.clamp(sim_pos.detach() - sim_neg1.detach(), min=0.0)
+        # Tính độ chênh lệch (Confidence Diff), giới hạn tối đa 1.0
+        diff = torch.clamp(sim_pos.detach() - sim_neg1.detach(), min=0.0, max=1.0)
         
-        # Scale Margin theo độ tự tin (Vùng lõi margin lớn ~0.15, vùng biên margin = 0)
-        m_pos_dyn = 0.25 * diff
+        # 1. Dynamic Margin (Kế thừa sức mạnh V30)
+        m_pos_dyn = 0.20 * diff
         m_neg_dyn = 0.10 * diff
 
-        # Áp dụng vào InfoNCE (Không bao giờ triệt tiêu Gradient)
-        pos_logit = (sim_pos - m_pos_dyn) / tau_dense
-        neg_logit_1 = (sim_neg1 + m_neg_dyn) / tau_dense
-        neg_logit_2 = ((feats * p_neg2).sum(dim=1, keepdim=True) + m_neg_dyn) / tau_dense
+        # 2. ĐỘT PHÁ V31: Dynamic Temperature
+        # Nếu tự tin cao (diff ~ 1) -> tau ~ 0.1 (Rất sắc nét cho Lung)
+        # Nếu tự tin thấp (diff ~ 0) -> tau ~ 0.3 (Mềm mỏng, chặn rác cho Deepglobe)
+        tau_dyn = 0.1 + 0.2 * (1.0 - diff)
+
+        # InfoNCE có kiểm soát kép
+        pos_logit = (sim_pos - m_pos_dyn) / tau_dyn
+        neg_logit_1 = (sim_neg1 + m_neg_dyn) / tau_dyn
+        neg_logit_2 = ((feats * p_neg2).sum(dim=1, keepdim=True) + m_neg_dyn) / tau_dyn
 
         lse = torch.logsumexp(torch.stack([pos_logit, neg_logit_1, neg_logit_2], dim=-1), dim=-1)
         loss_map = lse - pos_logit
         return (loss_map * mask).sum() / (mask.sum() + 1e-6)
 
     # --- A. CĂN CHỈNH TỪNG PIXEL TIỀN CẢNH ---
-    loss_fg_o = cam_p2p_loss(base_norm, fg_p_t, bg_p_t, bg_p_o, soft_mask_o)
-    loss_fg_t = cam_p2p_loss(trans_norm, fg_p_o, bg_p_o, bg_p_t, soft_mask_t)
+    loss_fg_o = dtam_p2p_loss(base_norm, fg_p_t, bg_p_t, bg_p_o, soft_mask_o)
+    loss_fg_t = dtam_p2p_loss(trans_norm, fg_p_o, bg_p_o, bg_p_t, soft_mask_t)
     loss_dense_fg = 0.5 * (loss_fg_o + loss_fg_t)
 
     # --- B. CĂN CHỈNH TỪNG PIXEL HẬU CẢNH ---
-    loss_bg_o = cam_p2p_loss(base_norm, bg_p_t, fg_p_t, fg_p_o, bg_mask_o)
-    loss_bg_t = cam_p2p_loss(trans_norm, bg_p_o, fg_p_o, fg_p_t, bg_mask_t)
+    loss_bg_o = dtam_p2p_loss(base_norm, bg_p_t, fg_p_t, fg_p_o, bg_mask_o)
+    loss_bg_t = dtam_p2p_loss(trans_norm, bg_p_o, fg_p_o, fg_p_t, bg_mask_t)
     loss_dense_bg = 0.5 * (loss_bg_o + loss_bg_t)
 
     # Tỷ lệ tổng hợp
-    return loss_global_fg + 0.2 * loss_global_bg + 0.5 * loss_dense_fg + 0.2 * loss_dense_bg
-
-    # --- A. CĂN CHỈNH TỪNG PIXEL TIỀN CẢNH ---
-    loss_fg_o = robust_gce_loss(base_norm, fg_p_t, bg_p_t, bg_p_o, soft_mask_o)
-    loss_fg_t = robust_gce_loss(trans_norm, fg_p_o, bg_p_o, bg_p_t, soft_mask_t)
-    loss_dense_fg = 0.5 * (loss_fg_o + loss_fg_t)
-
-    # --- B. CĂN CHỈNH TỪNG PIXEL HẬU CẢNH ---
-    loss_bg_o = robust_gce_loss(base_norm, bg_p_t, fg_p_t, fg_p_o, bg_mask_o)
-    loss_bg_t = robust_gce_loss(trans_norm, bg_p_o, fg_p_o, fg_p_t, bg_mask_t)
-    loss_dense_bg = 0.5 * (loss_bg_o + loss_bg_t)
-
-    # Tỷ lệ tổng hợp: Thuần khiết và toán học hóa 100%
     return loss_global_fg + 0.2 * loss_global_bg + 0.5 * loss_dense_fg + 0.2 * loss_dense_bg
 
 # -------------------hàm Lp ban đầu------------
