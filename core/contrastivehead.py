@@ -161,17 +161,14 @@ def self_attention_loss(f_base, f_transformed, mask_base, mask_transformed, k, a
 #            Nơi định nghĩa hàm loss Lp
 #------------------------------------------------
 
-def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, aug, tau_p=0.5, tau_hard=0.15):
+def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, aug, tau_p=0.5, tau_hard=0.25):
     assert transformed.shape == base.shape, ".."
     b, c, h, w = base.shape
     assert b == k * aug, 'provide correct k and aug such that dim0=k*aug'
 
-    # 1. Global Prototypes
+    # 1. Global Prototypes (Nền tảng ổn định)
     fg_proto_o, bg_proto_o = augwise_proto(base, mask_base, k, aug)
     fg_proto_t, bg_proto_t = augwise_proto(transformed, mask_transformed, k, aug)
-
-    # ĐỘT PHÁ V4: Orthogonal Penalty (Ép FG và BG trực giao, dập tắt dương tính giả ở ranh giới mờ)
-    loss_ortho = F.relu(ssim(fg_proto_o, bg_proto_o)).mean() + F.relu(ssim(fg_proto_t, bg_proto_t)).mean()
 
     pos_fg = torch.exp(ssim(fg_proto_o, fg_proto_t) / tau_p)
 
@@ -181,12 +178,12 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     loss_local = 0.0
 
     if h >= 20 and w >= 20: 
-        # A. Ultra-Hard Background Mining (tau_hard = 0.15 siêu sắc nét)
         feat_o_aug = torch.cat(base.view(k, aug, c, h * w).unbind(0), dim=-1)
         feat_t_aug = torch.cat(transformed.view(k, aug, c, h * w).unbind(0), dim=-1)
         mask_aug = torch.cat(segutils.downsample_mask(mask_base, h, w).view(k, aug, h * w).unbind(0), dim=-1)
         
-        bg_mask = (mask_aug <= 0.5).float()
+        # ĐỘT PHÁ 1: Soft Mask (Label Smoothing tự nhiên)
+        bg_mask = torch.clamp(1.0 - mask_aug, min=0.0, max=1.0)
         
         feat_o_norm = F.normalize(feat_o_aug, p=2, dim=1)
         feat_t_norm = F.normalize(feat_t_aug, p=2, dim=1)
@@ -196,8 +193,9 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
         sim_pixel_o = torch.sum(feat_o_norm * fg_o_norm.detach(), dim=1)
         sim_pixel_t = torch.sum(feat_t_norm * fg_t_norm.detach(), dim=1)
         
-        logits_bg_o = (sim_pixel_o / tau_hard).masked_fill(bg_mask < 0.5, -1e4)
-        logits_bg_t = (sim_pixel_t / tau_hard).masked_fill(bg_mask < 0.5, -1e4)
+        # Chỉ che những pixel có bg_mask rất nhỏ (< 0.1) để giữ lại viền mềm
+        logits_bg_o = (sim_pixel_o / tau_hard).masked_fill(bg_mask < 0.1, -1e4)
+        logits_bg_t = (sim_pixel_t / tau_hard).masked_fill(bg_mask < 0.1, -1e4)
         
         weights_bg_o = F.softmax(logits_bg_o, dim=-1) * bg_mask
         weights_bg_o = weights_bg_o / (weights_bg_o.sum(dim=-1, keepdim=True) + 1e-6)
@@ -210,17 +208,17 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
         neg_hard_o = 0.5 * (torch.exp(ssim(fg_proto_o, bg_hard_t) / tau_p) + torch.exp(ssim(fg_proto_o, bg_hard_o) / tau_p))
         neg_hard_t = 0.5 * (torch.exp(ssim(fg_proto_t, bg_hard_o) / tau_p) + torch.exp(ssim(fg_proto_t, bg_hard_t) / tau_p))
         
-        # B. Local Grid 2x2
+        # ĐỘT PHÁ 2: Confident Local Grid (Nâng ngưỡng lên 0.5 - Bỏ qua vùng nhãn lỗi của Deepglobe)
         mask_4d = segutils.downsample_mask(mask_base, h, w).unsqueeze(1).float()
         grid_area = F.adaptive_avg_pool2d(mask_4d, (2, 2))
-        valid_zones = (grid_area > 0.15).float().squeeze(1).view(b, 4)
+        valid_zones = (grid_area > 0.5).float().squeeze(1).view(b, 4)
         
         local_fg_o = (F.adaptive_avg_pool2d(base * mask_4d, (2, 2)) / (grid_area + 1e-6)).view(b, c, 4)
         local_fg_t = (F.adaptive_avg_pool2d(transformed * mask_4d, (2, 2)) / (grid_area + 1e-6)).view(b, c, 4)
         local_sim = F.cosine_similarity(local_fg_o, local_fg_t, dim=1)
         loss_local = ((1.0 - local_sim) * valid_zones).sum() / (valid_zones.sum() + 1e-6)
 
-    # 3. Symmetric Foreground Loss 
+    # 3. Tổng hợp Symmetric Foreground Loss
     neg_bg_o = 0.5 * (torch.exp(ssim(fg_proto_o, bg_proto_t) / tau_p) + torch.exp(ssim(fg_proto_o, bg_proto_o) / tau_p))
     neg_bg_t = 0.5 * (torch.exp(ssim(fg_proto_t, bg_proto_o) / tau_p) + torch.exp(ssim(fg_proto_t, bg_proto_t) / tau_p))
     
@@ -233,8 +231,7 @@ def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, a
     neg_bg_cross = 0.5 * (torch.exp(ssim(bg_proto_o, fg_proto_t) / tau_p) + torch.exp(ssim(bg_proto_t, fg_proto_o) / tau_p))
     loss_bg = -torch.log(pos_bg / (pos_bg + neg_bg_cross)).mean()
 
-    # Bổ sung 0.5 * loss_ortho vào tổng hợp
-    return loss_fg + 0.2 * loss_bg + 0.25 * loss_local + 0.5 * loss_ortho
+    return loss_fg + 0.2 * loss_bg + 0.25 * loss_local
 
 # -------------------hàm Lp ban đầu------------
 # features of base, transformed: [b,c,h,w]
