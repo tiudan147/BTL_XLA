@@ -161,24 +161,94 @@ def self_attention_loss(f_base, f_transformed, mask_base, mask_transformed, k, a
 #            Nơi định nghĩa hàm loss Lp
 #------------------------------------------------
 
-# features of base, transformed: [b,c,h,w]
-# if base features are aligned with transformed features, pass both same
-def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, aug):
+def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, aug, tau_p=0.5, tau_hard=0.3):
     assert transformed.shape == base.shape, ".."
     b, c, h, w = base.shape
     assert b == k * aug, 'provide correct k and aug such that dim0=k*aug'
     assert mask_base.shape == mask_transformed.shape == (b, h, w), ".."
+
+    # 1. Global Prototypes (Tận dụng đầy đủ cả bg_proto_o và bg_proto_t)
     fg_proto_o, bg_proto_o = augwise_proto(base, mask_base, k, aug)
     fg_proto_t, bg_proto_t = augwise_proto(transformed, mask_transformed, k, aug)
-    # i: fg, b: bg
-    # p_b_i, p_b_j = segutils.fg_bg_proto(base.view(b,c,h*w), mask_base.view(b,h*w))
-    # p_t_i, p_t_j = segutils.fg_bg_proto(transformed.view(b,c,h*w), mask_transformed.view(b,h*w))
-    enumer = torch.exp(
-        ssim(fg_proto_o, fg_proto_t))  # 5vs5 (augvsaug), but in 5-shot: 25vs25, no, you want also augvsaug
-    denom = torch.exp(ssim(fg_proto_o, fg_proto_t)) + torch.exp(ssim(fg_proto_o, bg_proto_t))
-    assert enumer.shape == denom.shape == torch.Size([aug]), 'you want to calculate one prototype for each augmentation'
-    loss = -torch.log(enumer / denom)  # [bsz]
-    return loss.mean()
+
+    # 2. Attentive Hard-Background Prototype (Tự động bắt các pixel nền dễ nhầm lẫn nhất)
+    feat_o_aug = torch.cat(base.view(k, aug, c, h * w).unbind(0), dim=-1)          # [aug, c, k*h*w]
+    feat_t_aug = torch.cat(transformed.view(k, aug, c, h * w).unbind(0), dim=-1)   # [aug, c, k*h*w]
+    mask_aug = torch.cat(segutils.downsample_mask(mask_base, h, w).view(k, aug, h * w).unbind(0), dim=-1)
+
+    bg_mask = (mask_aug <= 0.5).float()  # [aug, k*h*w]
+
+    # Chuẩn hóa L2 để đo độ tương đồng giữa từng pixel nền với FG prototype
+    feat_o_norm = F.normalize(feat_o_aug, p=2, dim=1)
+    feat_t_norm = F.normalize(feat_t_aug, p=2, dim=1)
+    fg_o_norm = F.normalize(fg_proto_o, p=2, dim=-1).unsqueeze(-1)  # [aug, c, 1]
+    fg_t_norm = F.normalize(fg_proto_t, p=2, dim=-1).unsqueeze(-1)  # [aug, c, 1]
+
+    sim_pixel_o = torch.sum(feat_o_norm * fg_o_norm.detach(), dim=1)  # [aug, k*h*w]
+    sim_pixel_t = torch.sum(feat_t_norm * fg_t_norm.detach(), dim=1)  # [aug, k*h*w]
+
+    # Che vùng FG bằng -1e4 để Softmax chỉ tập trung đánh trọng số cho vùng BG khó
+    logits_bg_o = (sim_pixel_o / tau_hard).masked_fill(bg_mask < 0.5, -1e4)
+    logits_bg_t = (sim_pixel_t / tau_hard).masked_fill(bg_mask < 0.5, -1e4)
+
+    weights_bg_o = F.softmax(logits_bg_o, dim=-1) * bg_mask
+    weights_bg_o = weights_bg_o / (weights_bg_o.sum(dim=-1, keepdim=True) + 1e-6)
+
+    weights_bg_t = F.softmax(logits_bg_t, dim=-1) * bg_mask
+    weights_bg_t = weights_bg_t / (weights_bg_t.sum(dim=-1, keepdim=True) + 1e-6)
+
+    bg_hard_o = torch.einsum('acn,an->ac', feat_o_aug, weights_bg_o)  # [aug, c]
+    bg_hard_t = torch.einsum('acn,an->ac', feat_t_aug, weights_bg_t)  # [aug, c]
+
+    # 3. Symmetric Hard-Aware InfoNCE Loss với Temperature tau_p
+    pos_sim = ssim(fg_proto_o, fg_proto_t) / tau_p  # [aug]
+
+    neg_o_t = ssim(fg_proto_o, bg_proto_t) / tau_p
+    neg_t_o = ssim(fg_proto_t, bg_proto_o) / tau_p
+    neg_hard_o = ssim(fg_proto_o, bg_hard_t) / tau_p
+    neg_hard_t = ssim(fg_proto_t, bg_hard_o) / tau_p
+
+    # Dùng logsumexp để đảm bảo ổn định gradient tuyệt đối
+    loss_o2t = -pos_sim + torch.logsumexp(torch.stack([pos_sim, neg_o_t, neg_hard_o], dim=-1), dim=-1)
+    loss_t2o = -pos_sim + torch.logsumexp(torch.stack([pos_sim, neg_t_o, neg_hard_t], dim=-1), dim=-1)
+    loss_global = 0.5 * (loss_o2t + loss_t2o).mean()
+
+    # 4. Local Grid (2x2) Prototype Consistency (Bảo toàn đa dạng vùng cho Deepglobe & SUIM)
+    mask_4d = segutils.downsample_mask(mask_base, h, w).unsqueeze(1).float()  # [b, 1, h, w]
+    if h >= 2 and w >= 2:
+        grid_area = F.adaptive_avg_pool2d(mask_4d, (2, 2))  # [b, 1, 2, 2]
+        valid_zones = (grid_area > 0.05).float().squeeze(1).view(b, 4)  # Chỉ xét ô có ít nhất 5% pixel FG
+
+        local_fg_o = (F.adaptive_avg_pool2d(base * mask_4d, (2, 2)) / (grid_area + 1e-6)).view(b, c, 4)
+        local_fg_t = (F.adaptive_avg_pool2d(transformed * mask_4d, (2, 2)) / (grid_area + 1e-6)).view(b, c, 4)
+
+        local_sim = F.cosine_similarity(local_fg_o, local_fg_t, dim=1)  # [b, 4]
+        loss_local = ((1.0 - local_sim) * valid_zones).sum() / (valid_zones.sum() + 1e-6)
+    else:
+        loss_local = 0.0
+
+    return loss_global + 0.3 * loss_local
+
+# -------------------hàm Lp ban đầu------------
+# features of base, transformed: [b,c,h,w]
+# if base features are aligned with transformed features, pass both same
+
+# def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, aug):
+#     assert transformed.shape == base.shape, ".."
+#     b, c, h, w = base.shape
+#     assert b == k * aug, 'provide correct k and aug such that dim0=k*aug'
+#     assert mask_base.shape == mask_transformed.shape == (b, h, w), ".."
+#     fg_proto_o, bg_proto_o = augwise_proto(base, mask_base, k, aug)
+#     fg_proto_t, bg_proto_t = augwise_proto(transformed, mask_transformed, k, aug)
+#     # i: fg, b: bg
+#     # p_b_i, p_b_j = segutils.fg_bg_proto(base.view(b,c,h*w), mask_base.view(b,h*w))
+#     # p_t_i, p_t_j = segutils.fg_bg_proto(transformed.view(b,c,h*w), mask_transformed.view(b,h*w))
+#     enumer = torch.exp(
+#         ssim(fg_proto_o, fg_proto_t))  # 5vs5 (augvsaug), but in 5-shot: 25vs25, no, you want also augvsaug
+#     denom = torch.exp(ssim(fg_proto_o, fg_proto_t)) + torch.exp(ssim(fg_proto_o, bg_proto_t))
+#     assert enumer.shape == denom.shape == torch.Size([aug]), 'you want to calculate one prototype for each augmentation'
+#     loss = -torch.log(enumer / denom)  # [bsz]
+#     return loss.mean()
 
 
 def opposite_proto_sim_in_aug(transformed_features, mapped_s_masks, k, aug):
