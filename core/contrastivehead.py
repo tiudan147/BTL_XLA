@@ -161,145 +161,79 @@ def self_attention_loss(f_base, f_transformed, mask_base, mask_transformed, k, a
 #            Nơi định nghĩa hàm loss Lp
 #------------------------------------------------
 
-#------------------------------------------------
-#            Nơi định nghĩa hàm loss Lp (Bản Tối Giản Tuyệt Đối V35)
-#------------------------------------------------
-
-#------------------------------------------------
-#            Nơi định nghĩa hàm loss Lp (Kiến trúc Đột phá TF-MiP2P)
-#------------------------------------------------
-
 def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, aug, tau_p=0.5):
     assert transformed.shape == base.shape, ".."
     b, c, h, w = base.shape
     assert b == k * aug, 'provide correct k and aug such that dim0=k*aug'
 
     # ==========================================
-    # 1. TÍNH TOÁN PROTOTYPE TOÀN CỤC & GLOBAL LOSS
+    # 1. TÍNH TOÁN PROTOTYPE TOÀN CỤC
     # ==========================================
     fg_proto_o, bg_proto_o = augwise_proto(base, mask_base, k, aug)
     fg_proto_t, bg_proto_t = augwise_proto(transformed, mask_transformed, k, aug)
 
+    # ==========================================
+    # 2. GLOBAL LOSS & ORTHOGONAL (Bảo vệ không gian vĩ mô)
+    # Chỉ ép FG đồng nhất chéo. Hậu cảnh được tự do!
+    # ==========================================
     pos_fg = torch.exp(ssim(fg_proto_o, fg_proto_t) / tau_p)
     neg_bg_o = 0.5 * (torch.exp(ssim(fg_proto_o, bg_proto_t) / tau_p) + torch.exp(ssim(fg_proto_o, bg_proto_o) / tau_p))
     neg_bg_t = 0.5 * (torch.exp(ssim(fg_proto_t, bg_proto_o) / tau_p) + torch.exp(ssim(fg_proto_t, bg_proto_t) / tau_p))
     loss_global_fg = 0.5 * (-torch.log(pos_fg / (pos_fg + neg_bg_o)) - torch.log(pos_fg / (pos_fg + neg_bg_t))).mean()
 
-    # Trực giao vĩ mô
+    # FG và BG của CÙNG một ảnh phải trực giao (Vuông góc tuyệt đối)
     loss_ortho = 0.5 * (F.relu(ssim(fg_proto_o, bg_proto_o)) + F.relu(ssim(fg_proto_t, bg_proto_t))).mean()
 
     # ==========================================
-    # 2. KIẾN TRÚC TENSOR-FUSED BMM (Đột phá Tốc độ & Bộ nhớ)
+    # 3. POLY-CONTRASTIVE DENSE P2P (Lưỡi dao Toán học PolyLoss)
+    # Tốc độ siêu nhanh, không mảng phụ, không BMM
     # ==========================================
     tau_dense = 0.2
     m_pos = 0.15 
     m_neg = 0.05 
+    epsilon = 1.0 # Trọng số Poly-1 (Bơm gradient sống còn cho ranh giới)
     
-    # Ép phẳng không gian để dùng cuBLAS BMM
-    base_flat = F.normalize(base, p=2, dim=1).view(b, c, h*w)
-    trans_flat = F.normalize(transformed, p=2, dim=1).view(b, c, h*w)
+    base_norm = F.normalize(base, p=2, dim=1)
+    trans_norm = F.normalize(transformed, p=2, dim=1)
 
-    # Đóng băng Mỏ neo và xếp thành ma trận
-    fg_p_o = F.normalize(fg_proto_o, p=2, dim=-1).unsqueeze(1).detach() # [b, 1, c]
-    bg_p_o = F.normalize(bg_proto_o, p=2, dim=-1).unsqueeze(1).detach()
-    fg_p_t = F.normalize(fg_proto_t, p=2, dim=-1).unsqueeze(1).detach()
-    bg_p_t = F.normalize(bg_proto_t, p=2, dim=-1).unsqueeze(1).detach()
+    # Đóng băng mỏ neo
+    fg_p_o = F.normalize(fg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
+    bg_p_o = F.normalize(bg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
+    fg_p_t = F.normalize(fg_proto_t, p=2, dim=-1).view(b, c, 1, 1).detach()
+    bg_p_t = F.normalize(bg_proto_t, p=2, dim=-1).view(b, c, 1, 1).detach()
 
-    # --- TẠO TỪ ĐIỂN MỎ NEO (DICTIONARY MATRICES) ---
-    # Tốc độ ánh sáng: Tính hàng triệu phép Cosine chỉ bằng 2 dòng lệnh
-    
-    # dict_o: [b, 4, c] -> Index: 0=fg_t, 1=bg_t, 2=bg_o, 3=fg_o
-    dict_o = torch.cat([fg_p_t, bg_p_t, bg_p_o, fg_p_o], dim=1)
-    sims_o = torch.bmm(dict_o, base_flat).view(b, 4, h, w) # Kết quả: [b, 4, h, w]
-
-    # dict_t: [b, 4, c] -> Index: 0=fg_o, 1=bg_o, 2=bg_t, 3=fg_t
-    dict_t = torch.cat([fg_p_o, bg_p_o, bg_p_t, fg_p_t], dim=1)
-    sims_t = torch.bmm(dict_t, trans_flat).view(b, 4, h, w)
-
-    soft_mask_o = segutils.downsample_mask(mask_base, h, w).squeeze(1) # [b, h, w]
-    soft_mask_t = segutils.downsample_mask(mask_transformed, h, w).squeeze(1)
+    soft_mask_o = segutils.downsample_mask(mask_base, h, w).unsqueeze(1)
+    soft_mask_t = segutils.downsample_mask(mask_transformed, h, w).unsqueeze(1)
     bg_mask_o = torch.clamp(1.0 - soft_mask_o, min=0.0, max=1.0)
     bg_mask_t = torch.clamp(1.0 - soft_mask_t, min=0.0, max=1.0)
 
-    # Đích đến (Target) cho Cross Entropy luôn là Index 0 trong ma trận cắt
-    targets = torch.zeros((b, h, w), dtype=torch.long, device=base.device)
+    # --- HÀM INFO-NCE TÍCH HỢP ĐA THỨC POLY-LOSS ---
+    def poly_infonce(feats, p_pos, p_neg1, p_neg2, mask):
+        pos_logit = ((feats * p_pos).sum(dim=1, keepdim=True) - m_pos) / tau_dense
+        neg_logit1 = ((feats * p_neg1).sum(dim=1, keepdim=True) + m_neg) / tau_dense
+        neg_logit2 = ((feats * p_neg2).sum(dim=1, keepdim=True) + m_neg) / tau_dense
+        
+        # Cross Entropy truyền thống (InfoNCE)
+        lse = torch.logsumexp(torch.stack([pos_logit, neg_logit1, neg_logit2], dim=-1), dim=-1)
+        ce_loss = lse - pos_logit
+        
+        # Poly-1 Expansion: epsilon * (1 - P_target)
+        p_target = torch.exp(-ce_loss)
+        poly_loss = ce_loss + epsilon * (1.0 - p_target)
+        
+        return (poly_loss * mask).sum() / (mask.sum() + 1e-6)
 
-    # ==========================================
-    # 3. KERNELIZED MARGIN CROSS-ENTROPY (Giải phóng CPU/GPU)
-    # Không còn logsumexp, không còn manual math!
-    # ==========================================
-    
-    # --- A. CĂN CHỈNH TIỀN CẢNH (Cắt lát ma trận: lấy index 0,1,2) ---
-    logits_fg_o = sims_o[:, :3].clone()
-    logits_fg_o[:, 0] -= m_pos      # Target 
-    logits_fg_o[:, 1:] += m_neg     # Negatives
-    logits_fg_o /= tau_dense
-    loss_fg_map_o = F.cross_entropy(logits_fg_o, targets, reduction='none')
+    # --- A. CĂN CHỈNH TIỀN CẢNH (CROSS-VIEW PULL) ---
+    # Ép pixel về Mỏ neo của ảnh BIẾN ĐỔI chéo (Bảo tồn tính bất biến)
+    loss_fg_o = poly_infonce(base_norm, fg_p_t, bg_p_t, bg_p_o, soft_mask_o)
+    loss_fg_t = poly_infonce(trans_norm, fg_p_o, bg_p_o, bg_p_t, soft_mask_t)
+    loss_dense_fg = 0.5 * (loss_fg_o + loss_fg_t)
 
-    logits_fg_t = sims_t[:, :3].clone()
-    logits_fg_t[:, 0] -= m_pos
-    logits_fg_t[:, 1:] += m_neg
-    logits_fg_t /= tau_dense
-    loss_fg_map_t = F.cross_entropy(logits_fg_t, targets, reduction='none')
-
-    loss_dense_fg = 0.5 * ((loss_fg_map_o * soft_mask_o).sum() / (soft_mask_o.sum() + 1e-6) +
-                           (loss_fg_map_t * soft_mask_t).sum() / (soft_mask_t.sum() + 1e-6))
-
-    # --- B. CĂN CHỈNH HẬU CẢNH (Cắt lát ma trận: lấy index 2,3,0) ---
-    logits_bg_o = sims_o[:, [2, 3, 0]].clone()
-    logits_bg_o[:, 0] -= m_pos
-    logits_bg_o[:, 1:] += m_neg
-    logits_bg_o /= tau_dense
-    loss_bg_map_o = F.cross_entropy(logits_bg_o, targets, reduction='none')
-
-    logits_bg_t = sims_t[:, [2, 3, 0]].clone()
-    logits_bg_t[:, 0] -= m_pos
-    logits_bg_t[:, 1:] += m_neg
-    logits_bg_t /= tau_dense
-    loss_bg_map_t = F.cross_entropy(logits_bg_t, targets, reduction='none')
-
-    loss_dense_bg = 0.5 * ((loss_bg_map_o * bg_mask_o).sum() / (bg_mask_o.sum() + 1e-6) +
-                           (loss_bg_map_t * bg_mask_t).sum() / (bg_mask_t.sum() + 1e-6))
-
-    # Tỷ lệ tổng hợp
-    return loss_global_fg + 0.5 * loss_ortho + 0.5 * loss_dense_fg + 0.2 * loss_dense_bg
-
-    # ==========================================
-    # 3. KERNELIZED MARGIN CROSS-ENTROPY (Giải phóng CPU/GPU)
-    # Không còn logsumexp, không còn manual math!
-    # ==========================================
-    
-    # --- A. CĂN CHỈNH TIỀN CẢNH (Cắt lát ma trận: lấy index 0,1,2) ---
-    logits_fg_o = sims_o[:, :3].clone()
-    logits_fg_o[:, 0] -= m_pos      # Target 
-    logits_fg_o[:, 1:] += m_neg     # Negatives
-    logits_fg_o /= tau_dense
-    loss_fg_map_o = F.cross_entropy(logits_fg_o, targets, reduction='none')
-
-    logits_fg_t = sims_t[:, :3].clone()
-    logits_fg_t[:, 0] -= m_pos
-    logits_fg_t[:, 1:] += m_neg
-    logits_fg_t /= tau_dense
-    loss_fg_map_t = F.cross_entropy(logits_fg_t, targets, reduction='none')
-
-    loss_dense_fg = 0.5 * ((loss_fg_map_o * soft_mask_o).sum() / (soft_mask_o.sum() + 1e-6) +
-                           (loss_fg_map_t * soft_mask_t).sum() / (soft_mask_t.sum() + 1e-6))
-
-    # --- B. CĂN CHỈNH HẬU CẢNH (Cắt lát ma trận: lấy index 2,3,0) ---
-    logits_bg_o = sims_o[:, [2, 3, 0]].clone()
-    logits_bg_o[:, 0] -= m_pos
-    logits_bg_o[:, 1:] += m_neg
-    logits_bg_o /= tau_dense
-    loss_bg_map_o = F.cross_entropy(logits_bg_o, targets, reduction='none')
-
-    logits_bg_t = sims_t[:, [2, 3, 0]].clone()
-    logits_bg_t[:, 0] -= m_pos
-    logits_bg_t[:, 1:] += m_neg
-    logits_bg_t /= tau_dense
-    loss_bg_map_t = F.cross_entropy(logits_bg_t, targets, reduction='none')
-
-    loss_dense_bg = 0.5 * ((loss_bg_map_o * bg_mask_o).sum() / (bg_mask_o.sum() + 1e-6) +
-                           (loss_bg_map_t * bg_mask_t).sum() / (bg_mask_t.sum() + 1e-6))
+    # --- B. CĂN CHỈNH HẬU CẢNH (INTRA-VIEW PULL) ---
+    # Đỉnh cao Logic: Nền ảnh nào thì gom về Mỏ neo ảnh đó, KHÔNG bắt chéo ép uổng!
+    loss_bg_o = poly_infonce(base_norm, bg_p_o, fg_p_o, fg_p_t, bg_mask_o)
+    loss_bg_t = poly_infonce(trans_norm, bg_p_t, fg_p_t, fg_p_o, bg_mask_t)
+    loss_dense_bg = 0.5 * (loss_bg_o + loss_bg_t)
 
     # Tỷ lệ tổng hợp
     return loss_global_fg + 0.5 * loss_ortho + 0.5 * loss_dense_fg + 0.2 * loss_dense_bg
