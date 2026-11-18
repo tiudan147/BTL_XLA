@@ -14,9 +14,9 @@ class ContrastiveConfig:
             self._data = {
                 'aug': {
                     'n_transformed_imgs': 2,
-                    'blurkernelsize': [1],  # chooses one of this kernel sizes
-                    'maxjitter': 0.0,
-                    'maxangle': 0,  # rotation
+                    'blurkernelsize': [2],  # chooses one of this kernel sizes
+                    'maxjitter': 0.2,
+                    'maxangle': 15,  # rotation
                     # 'translate': (0,0),  # BE CAREFUL WITH TRANSLATE - if you apply it on the feature volume that has smaller spatial dims correspondences break
                     'maxscale': 1.0,  # 1.0 = No scaling
                     'maxshear': 20,
@@ -88,30 +88,34 @@ class ContrastiveConfig:
     def __repr__(self):
         return str(self._data)
 
+#------------------------------------------------
+#            Nơi định nghĩa hàm loss Lq, Ls
+#------------------------------------------------
 
 def dense_info_nce_loss(original_features, transformed_features, config_nce):
     B, C, H, W = transformed_features.shape
-    o_features = original_features.expand(B, C, H, W).flatten(2).transpose(1, 2)  # (B, HW, C)
-    t_features = transformed_features.flatten(2)                                   # (B, C, HW)
+    o_features = original_features.expand(B, C, H, W).permute(0, 2, 3, 1).view(B, H * W, C)
+    t_features = transformed_features.permute(0, 2, 3, 1).view(B, H * W, C)
 
-    # Compute all pair dot-products efficiently via bmm (B, HW, HW)
-    all_logits = torch.bmm(o_features, t_features) / config_nce.temperature
+    # Calculate dot product between original and transformed feature vectors for positive pairs
+    positive_logits = torch.einsum('bik,bik->bi', o_features, t_features) / config_nce.temperature
 
-    # Positive pairs are the exact diagonal elements (zero-copy view)
-    positive_logits = torch.diagonal(all_logits, dim1=-2, dim2=-1)  # (B, HW)
+    # Calculate dot product between original features and all other transformed features for negative pairs
+    all_logits = torch.einsum('bik,bjk->bij', o_features, t_features) / config_nce.temperature
 
     if config_nce.debug: print('pos/neg:', positive_logits.mean().detach(), all_logits.mean().detach())
 
-    # Fused, numerically stable logsumexp without temporary memory allocations
-    log_sum_exp = torch.logsumexp(all_logits, dim=-1)
+    # Using the log-sum-exp trick
+    max_logits = torch.max(all_logits, dim=-1, keepdim=True).values
+    log_sum_exp = max_logits + torch.log(torch.sum(torch.exp(all_logits - max_logits), dim=-1, keepdim=True))
 
     # Compute InfoNCE loss
-    loss = (log_sum_exp - positive_logits).mean()
-    return loss
+    loss = - (positive_logits - log_sum_exp.squeeze())
+    return loss.mean()  # [B=k*aug] or [B=k] -> scalar
 
 
 def ssim(a, b):
-    return F.cosine_similarity(a, b)
+    return torch.nn.CosineSimilarity()(a, b)
 
 def augwise_proto(feat_vol, mask, k, aug):
     k, aug, c, h, w = k, aug, *feat_vol.shape[-3:]
@@ -153,25 +157,115 @@ def self_attention_loss(f_base, f_transformed, mask_base, mask_transformed, k, a
     loss = torch.nn.BCELoss()(pred_map.float(), pseudoquerymask.float())
     return loss.mean()
 
+#------------------------------------------------
+#            Nơi định nghĩa hàm loss Lp
+#------------------------------------------------
 
-# features of base, transformed: [b,c,h,w]
-# if base features are aligned with transformed features, pass both same
-def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, aug):
+#------------------------------------------------
+#            Nơi định nghĩa hàm loss Lp (Bản Tối Giản Tuyệt Đối V35)
+#------------------------------------------------
+
+def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, aug, tau_p=0.5):
     assert transformed.shape == base.shape, ".."
     b, c, h, w = base.shape
     assert b == k * aug, 'provide correct k and aug such that dim0=k*aug'
-    assert mask_base.shape == mask_transformed.shape == (b, h, w), ".."
+
+    # ==========================================
+    # 1. TÍNH TOÁN PROTOTYPE TOÀN CỤC & GLOBAL LOSS
+    # ==========================================
     fg_proto_o, bg_proto_o = augwise_proto(base, mask_base, k, aug)
     fg_proto_t, bg_proto_t = augwise_proto(transformed, mask_transformed, k, aug)
-    # i: fg, b: bg
-    # p_b_i, p_b_j = segutils.fg_bg_proto(base.view(b,c,h*w), mask_base.view(b,h*w))
-    # p_t_i, p_t_j = segutils.fg_bg_proto(transformed.view(b,c,h*w), mask_transformed.view(b,h*w))
-    enumer = torch.exp(
-        ssim(fg_proto_o, fg_proto_t))  # 5vs5 (augvsaug), but in 5-shot: 25vs25, no, you want also augvsaug
-    denom = torch.exp(ssim(fg_proto_o, fg_proto_t)) + torch.exp(ssim(fg_proto_o, bg_proto_t))
-    assert enumer.shape == denom.shape == torch.Size([aug]), 'you want to calculate one prototype for each augmentation'
-    loss = -torch.log(enumer / denom)  # [bsz]
-    return loss.mean()
+
+    pos_fg = torch.exp(ssim(fg_proto_o, fg_proto_t) / tau_p)
+    neg_bg_o = 0.5 * (torch.exp(ssim(fg_proto_o, bg_proto_t) / tau_p) + torch.exp(ssim(fg_proto_o, bg_proto_o) / tau_p))
+    neg_bg_t = 0.5 * (torch.exp(ssim(fg_proto_t, bg_proto_o) / tau_p) + torch.exp(ssim(fg_proto_t, bg_proto_t) / tau_p))
+    loss_global_fg = 0.5 * (-torch.log(pos_fg / (pos_fg + neg_bg_o)) - torch.log(pos_fg / (pos_fg + neg_bg_t))).mean()
+
+    pos_bg = torch.exp(ssim(bg_proto_o, bg_proto_t) / tau_p)
+    neg_bg_cross = 0.5 * (torch.exp(ssim(bg_proto_o, fg_proto_t) / tau_p) + torch.exp(ssim(bg_proto_t, fg_proto_o) / tau_p))
+    loss_global_bg = -torch.log(pos_bg / (pos_bg + neg_bg_cross)).mean()
+
+    # TRỰC GIAO HÓA (Đảm bảo sự chia cắt 2 thái cực)
+    loss_ortho = 0.5 * (F.relu(ssim(fg_proto_o, bg_proto_o)) + F.relu(ssim(fg_proto_t, bg_proto_t))).mean()
+
+    # ==========================================
+    # 2. HARMONIZED MARGIN PIXEL-TO-PROTOTYPE (Đỉnh cao của sự thấu hiểu dữ liệu)
+    # ==========================================
+    tau_dense = 0.2
+    
+    # Kỷ luật thép cho Tiền cảnh (Ép chặt, mài sắc viền)
+    fg_m_pos = 0.15 
+    fg_m_neg = 0.05 
+    
+    # Khoan dung cho Hậu cảnh đa phương thức (Chỉ cần tránh xa Tiền cảnh, không ép co cụm)
+    bg_m_pos = 0.05 
+    bg_m_neg = 0.15 
+    
+    base_norm = F.normalize(base, p=2, dim=1)
+    trans_norm = F.normalize(transformed, p=2, dim=1)
+
+    # Đóng băng Mỏ neo tĩnh
+    fg_p_o = F.normalize(fg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
+    bg_p_o = F.normalize(bg_proto_o, p=2, dim=-1).view(b, c, 1, 1).detach()
+    fg_p_t = F.normalize(fg_proto_t, p=2, dim=-1).view(b, c, 1, 1).detach()
+    bg_p_t = F.normalize(bg_proto_t, p=2, dim=-1).view(b, c, 1, 1).detach()
+
+    soft_mask_o = segutils.downsample_mask(mask_base, h, w).unsqueeze(1)
+    soft_mask_t = segutils.downsample_mask(mask_transformed, h, w).unsqueeze(1)
+    bg_mask_o = torch.clamp(1.0 - soft_mask_o, min=0.0, max=1.0)
+    bg_mask_t = torch.clamp(1.0 - soft_mask_t, min=0.0, max=1.0)
+
+    # --- A. CĂN CHỈNH TỪNG PIXEL TIỀN CẢNH ---
+    pos_fg_o = ((base_norm * fg_p_t).sum(dim=1, keepdim=True) - fg_m_pos) / tau_dense
+    neg_fg_o_1 = ((base_norm * bg_p_t).sum(dim=1, keepdim=True) + fg_m_neg) / tau_dense
+    neg_fg_o_2 = ((base_norm * bg_p_o).sum(dim=1, keepdim=True) + fg_m_neg) / tau_dense
+    loss_fg_map_o = torch.logsumexp(torch.stack([pos_fg_o, neg_fg_o_1, neg_fg_o_2], dim=-1), dim=-1) - pos_fg_o
+
+    pos_fg_t = ((trans_norm * fg_p_o).sum(dim=1, keepdim=True) - fg_m_pos) / tau_dense
+    neg_fg_t_1 = ((trans_norm * bg_p_o).sum(dim=1, keepdim=True) + fg_m_neg) / tau_dense
+    neg_fg_t_2 = ((trans_norm * bg_p_t).sum(dim=1, keepdim=True) + fg_m_neg) / tau_dense
+    loss_fg_map_t = torch.logsumexp(torch.stack([pos_fg_t, neg_fg_t_1, neg_fg_t_2], dim=-1), dim=-1) - pos_fg_t
+
+    loss_dense_fg = 0.5 * ((loss_fg_map_o * soft_mask_o).sum() / (soft_mask_o.sum() + 1e-6) +
+                           (loss_fg_map_t * soft_mask_t).sum() / (soft_mask_t.sum() + 1e-6))
+
+    # --- B. CĂN CHỈNH TỪNG PIXEL HẬU CẢNH ---
+    pos_bg_o = ((base_norm * bg_p_t).sum(dim=1, keepdim=True) - bg_m_pos) / tau_dense
+    neg_bg_o_1 = ((base_norm * fg_p_t).sum(dim=1, keepdim=True) + bg_m_neg) / tau_dense
+    neg_bg_o_2 = ((base_norm * fg_p_o).sum(dim=1, keepdim=True) + bg_m_neg) / tau_dense
+    loss_bg_map_o = torch.logsumexp(torch.stack([pos_bg_o, neg_bg_o_1, neg_bg_o_2], dim=-1), dim=-1) - pos_bg_o
+
+    pos_bg_t = ((trans_norm * bg_p_o).sum(dim=1, keepdim=True) - bg_m_pos) / tau_dense
+    neg_bg_t_1 = ((trans_norm * fg_p_o).sum(dim=1, keepdim=True) + bg_m_neg) / tau_dense
+    neg_bg_t_2 = ((trans_norm * fg_p_t).sum(dim=1, keepdim=True) + bg_m_neg) / tau_dense
+    loss_bg_map_t = torch.logsumexp(torch.stack([pos_bg_t, neg_bg_t_1, neg_bg_t_2], dim=-1), dim=-1) - pos_bg_t
+
+    loss_dense_bg = 0.5 * ((loss_bg_map_o * bg_mask_o).sum() / (bg_mask_o.sum() + 1e-6) +
+                           (loss_bg_map_t * bg_mask_t).sum() / (bg_mask_t.sum() + 1e-6))
+
+    # Tỷ lệ tổng hợp
+    return loss_global_fg + 0.2 * loss_global_bg + 0.5 * loss_ortho + 0.5 * loss_dense_fg + 0.2 * loss_dense_bg
+
+# -------------------hàm Lp ban đầu------------
+# features of base, transformed: [b,c,h,w]
+# if base features are aligned with transformed features, pass both same
+
+# def ctrstive_prototype_loss(base, transformed, mask_base, mask_transformed, k, aug):
+#     assert transformed.shape == base.shape, ".."
+#     b, c, h, w = base.shape
+#     assert b == k * aug, 'provide correct k and aug such that dim0=k*aug'
+#     assert mask_base.shape == mask_transformed.shape == (b, h, w), ".."
+#     fg_proto_o, bg_proto_o = augwise_proto(base, mask_base, k, aug)
+#     fg_proto_t, bg_proto_t = augwise_proto(transformed, mask_transformed, k, aug)
+#     # i: fg, b: bg
+#     # p_b_i, p_b_j = segutils.fg_bg_proto(base.view(b,c,h*w), mask_base.view(b,h*w))
+#     # p_t_i, p_t_j = segutils.fg_bg_proto(transformed.view(b,c,h*w), mask_transformed.view(b,h*w))
+#     enumer = torch.exp(
+#         ssim(fg_proto_o, fg_proto_t))  # 5vs5 (augvsaug), but in 5-shot: 25vs25, no, you want also augvsaug
+#     denom = torch.exp(ssim(fg_proto_o, fg_proto_t)) + torch.exp(ssim(fg_proto_o, bg_proto_t))
+#     assert enumer.shape == denom.shape == torch.Size([aug]), 'you want to calculate one prototype for each augmentation'
+#     loss = -torch.log(enumer / denom)  # [bsz]
+#     return loss.mean()
 
 
 def opposite_proto_sim_in_aug(transformed_features, mapped_s_masks, k, aug):
@@ -204,30 +298,193 @@ def keep_var_loss(original_features, transformed_features):
         vardiff).mean()  # [k*aug,c] -> [scalar] or  [aug,c] -> [scalar]
     return keepvarloss
 
+#-----------------------------------------------------
+#         Vị trí mạng adapter
+#---------------------------------------------------------
+
+#-------------------NAF------------------------------
+
+# class SimpleGate(nn.Module):
+#     def forward(self, x):
+#         # Cắt đôi Tensor theo chiều kênh
+#         x1, x2 = x.chunk(2, dim=1)
+#         # Nửa này làm mặt nạ Attention động cho nửa kia (0 tham số học, 0 làm mờ)
+#         return x1 * x2
+
+# class NAFBlock(nn.Module):
+#     def __init__(self, channels=64):
+#         super(NAFBlock, self).__init__()
+        
+#         # 1. LayerNorm: Vua ổn định, triệt tiêu nhiễu loạn của Few-Shot (Batch Size = 1)
+#         self.norm = nn.LayerNorm(channels, eps=1e-6)
+        
+#         # 2. Conv1x1 mở rộng kênh gấp đôi (để chuẩn bị cho SimpleGate)
+#         self.conv1 = nn.Conv2d(channels, channels * 2, kernel_size=1, bias=False)
+        
+#         # 3. Depthwise 3x3: Lấy hình khối cho Lung/ISIC nhưng KHÔNG trộn kênh để bảo vệ Deepglobe
+#         self.dw_conv = nn.Conv2d(channels * 2, channels * 2, kernel_size=3, padding=1, groups=channels * 2, bias=False)
+        
+#         # 4. Cổng ma thuật NAF (Thay thế hoàn toàn Attention, ReLU, Sigmoid)
+#         self.sg = SimpleGate()
+        
+#         # 5. Conv1x1: Gom đặc trưng sắc nét trả về
+#         self.conv2 = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+
+#     def forward(self, x):
+#         identity = x
+        
+#         # Bước 1: Chuẩn hóa LayerNorm (Chuyển kênh về cuối để tính, rồi trả lại)
+#         out = x.permute(0, 2, 3, 1)
+#         out = self.norm(out)
+#         out = out.permute(0, 3, 1, 2)
+        
+#         # Bước 2: Tích chập mở rộng và thu thập ngữ cảnh 3x3
+#         out = self.conv1(out)
+#         out = self.dw_conv(out)
+        
+#         # Bước 3: Phép nhân SimpleGate (Tuyệt kỹ phân tách nền/vật thể mà không cần Pooling)
+#         out = self.sg(out)
+        
+#         # Bước 4: Khôi phục và cộng Residual
+#         out = self.conv2(out)
+        
+#         return identity + out
+
+
+#---------------------------LFC------------------------
+class LCFAttention(nn.Module):
+    def __init__(self, channels=64):
+        super(LCFAttention, self).__init__()
+        
+        # 1. Depthwise 3x3: Chiều chuộng Lung/ISIC (Lấy hình khối, không làm mờ chéo)
+        self.dw_conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False)
+        
+        # 2. LayerNorm: Chiều chuộng Few-Shot (Miễn nhiễm hoàn toàn với Batch Size = 1)
+        self.norm = nn.LayerNorm(channels, eps=1e-6)
+        
+        # 3. ECA Conv1D: Chiều chuộng Deepglobe (Đánh trọng số kênh không cần nén)
+        self.eca_pool = nn.AdaptiveAvgPool2d(1)
+        self.eca_conv = nn.Conv1d(1, 1, kernel_size=3, padding=1, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        identity = x
+        
+        # Bước 1: Trích xuất không gian lân cận
+        out = self.dw_conv(x)
+        
+        # Bước 2: Chuẩn hóa cực kỳ ổn định bằng LayerNorm
+        out = out.permute(0, 2, 3, 1) # Đảo chiều B, C, H, W -> B, H, W, C
+        out = self.norm(out)
+        out = out.permute(0, 3, 1, 2) # Đảo lại B, C, H, W
+        
+        # Bước 3: Trích xuất trọng số Kênh (ECA)
+        v = self.eca_pool(out).squeeze(-1).transpose(-1, -2) # [B, 1, C]
+        v = self.eca_conv(v)
+        v = v.transpose(-1, -2).unsqueeze(-1) # [B, C, 1, 1]
+        
+        # Bước 4: Trộn trọng số và Cộng Residual giữ độ nét
+        return identity + (out * self.sigmoid(v))
+
+
 class ContrastiveFeatureTransformer(nn.Module):
+    # def __init__(self, in_channels, config_model):
+    #     super(ContrastiveFeatureTransformer, self).__init__()
+
+    #     out_channels, kernel_size = config_model.out_channels, config_model.kernel_size
+    #     # Add a convolutional layer and a batch normalization layer for learning
+    #     self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, padding=(kernel_size - 1) // 2)
+    #     self.bn = nn.BatchNorm2d(out_channels)
+    #     self.linear = nn.Conv2d(out_channels, out_channels, 1)
+
+    #     self.prepend_relu = config_model.prepend_relu
+    #     self.append_normalize = config_model.append_normalize
+    #     #self.debug = config_model.debug
+
+    # def forward(self, x):
+    #     if self.prepend_relu:
+    #         x = nn.ReLU()(x)
+    #     x = self.conv(x)
+    #     x = self.bn(x)
+    #     x = nn.ReLU()(x)
+    #     x = self.linear(x)
+    #     if self.append_normalize:
+    #         x = F.normalize(x, p=2, dim=1)
+    #     return x
+
+
+#----------NFABlock---------------------------------
+
+
+    # def __init__(self, in_channels, config_model):
+    #     super(ContrastiveFeatureTransformer, self).__init__()
+    #     out_channels = config_model.out_channels
+        
+    #     # Nén kênh từ ResNet
+    #     self.project = nn.Sequential(
+    #         nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+    #         nn.BatchNorm2d(out_channels), 
+    #         nn.ReLU(inplace=True)
+    #     )
+        
+    #     # Khối NAFBlock - Đỉnh cao của sự đơn giản và bảo toàn đặc trưng
+    #     self.naf_block = NAFBlock(channels=out_channels)
+        
+    #     # Trộn lại
+    #     self.final_conv = nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False)
+
+    #     self.prepend_relu = config_model.prepend_relu
+    #     self.append_normalize = config_model.append_normalize
+
+    # def forward(self, x):
+    #     if self.prepend_relu:
+    #         x = F.relu(x)
+            
+    #     x = self.project(x)
+    #     x = self.naf_block(x)
+    #     out = self.final_conv(x)
+        
+    #     if self.append_normalize:
+    #         out = F.normalize(out, p=2, dim=1)
+            
+    #     return out
+
+#-----------------LCF------------------------------
+
+
     def __init__(self, in_channels, config_model):
         super(ContrastiveFeatureTransformer, self).__init__()
-
-        out_channels, kernel_size = config_model.out_channels, config_model.kernel_size
-        # Add a convolutional layer and a batch normalization layer for learning
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, padding=(kernel_size - 1) // 2)
-        self.bn = nn.BatchNorm2d(out_channels)
-        self.linear = nn.Conv2d(out_channels, out_channels, 1)
+        out_channels = config_model.out_channels
+        
+        # Nén kênh từ ResNet (Giữ nguyên BatchNorm mặc định của ResNet)
+        self.project = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Khối LCF: Sự dung hòa tối thượng giữa Không gian, Kênh và Độ ổn định
+        self.lcf_block = LCFAttention(channels=out_channels)
+        
+        # Trộn lại
+        self.final_conv = nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False)
 
         self.prepend_relu = config_model.prepend_relu
         self.append_normalize = config_model.append_normalize
-        #self.debug = config_model.debug
 
     def forward(self, x):
         if self.prepend_relu:
-            x = F.relu(x, inplace=True)
-        x = self.conv(x)
-        x = self.bn(x)
-        x = F.relu(x, inplace=True)
-        x = self.linear(x)
+            x = F.relu(x)
+            
+        x = self.project(x)
+        x = self.lcf_block(x)
+        out = self.final_conv(x)
+        
         if self.append_normalize:
-            x = F.normalize(x, p=2, dim=1)
-        return x
+            out = F.normalize(out, p=2, dim=1)
+            
+        return out
+
 
     # fits the model for one semantic class, therefore does not work with batches
     # mapped_qfeat_vol, aug_qfeat_vols: [aug,c,h,w]
@@ -235,88 +492,78 @@ class ContrastiveFeatureTransformer(nn.Module):
     # augmented_smasks: [k*aug,h,w]
     def fit(self, mapped_qfeat_vol, aug_qfeat_vols, mapped_sfeat_vol, aug_sfeat_vols, augmented_smasks, config_fit):
         f_norm = F.normalize if config_fit.normalize_after_fwd_pass else identity_mapping
-        # Add momentum and weight_decay for better convergence and benchmark quality
-        optimizer_kwargs = dict(lr=config_fit.lr)
-        if config_fit.optimizer in (torch.optim.SGD,):
-            optimizer_kwargs.update(momentum=0.9, weight_decay=1e-4)
-        optimizer = config_fit.optimizer(self.parameters(), **optimizer_kwargs)
-
-        # Mixed precision scaler for CUDA speedup
-        use_amp = torch.cuda.is_available() and mapped_qfeat_vol.is_cuda
-        scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
-
-        # Early stopping state
-        best_loss = float('inf')
-        patience_counter = 0
-        early_stop_patience = 5
-        early_stop_min_delta = 1e-4
-
+        optimizer = config_fit.optimizer(self.parameters(), lr=config_fit.lr)
         for epoch in range(config_fit.num_epochs):
             # Pass original and transformed image batches through the model
-            # Wrap forward pass and loss computation with AMP autocast for ~25-40% CUDA speedup
-            with torch.amp.autocast('cuda', enabled=use_amp):
-                # Q
-                original_features = f_norm(self(mapped_qfeat_vol), p=2, dim=1)  # fwd pass non-augmented
-                transformed_features = f_norm(self(aug_qfeat_vols), p=2, dim=1)  # fwd pass augmented
 
-                qloss = dense_info_nce_loss(original_features, transformed_features,
-                                            config_fit.nce) if config_fit.q_nceloss else 0
-                if config_fit.keepvarloss:  # 1. idea: Let query and support have the same feature distribution (mean/var per channel)
-                    qloss += keep_var_loss(original_features, transformed_features)
-                # S
-                original_features = f_norm(self(mapped_sfeat_vol), p=2, dim=1)  # fwd pass non-augmented
-                transformed_features = f_norm(self(aug_sfeat_vols), p=2, dim=1)  # fwd pass augmented
+            # Q
+            original_features = f_norm(self(mapped_qfeat_vol), p=2, dim=1)  # fwd pass non-augmented
+            transformed_features = f_norm(self(aug_qfeat_vols), p=2, dim=1)  # fwd pass augmented
 
-                sloss = dense_info_nce_loss(original_features, transformed_features,
-                                            config_fit.nce) if config_fit.s_nceloss else 0
-                if config_fit.keepvarloss:
-                    sloss += keep_var_loss(original_features, transformed_features)
+            qloss = dense_info_nce_loss(original_features, transformed_features,
+                                        config_fit.nce) if config_fit.q_nceloss else 0
+            if config_fit.keepvarloss:  # 1. idea: Let query and support have the same feature distribution (mean/var per channel)
+                qloss += keep_var_loss(original_features, transformed_features)
+            # S
+            original_features = f_norm(self(mapped_sfeat_vol), p=2, dim=1)  # fwd pass non-augmented
+            transformed_features = f_norm(self(aug_sfeat_vols), p=2, dim=1)  # fwd pass augmented
 
-                # 2. class-aware loss: opposite classes should get opposite features
-                # for prototype calculation, we want only one prototype per class
-                # so we average over features of entire k
-                # but calculate prototype for each augmentation individually [k*aug,c,h,w]->[aug,c,k*h*w]->[aug,c]
-                kaug, c, h, w = transformed_features.shape
-                aug = aug_qfeat_vols.shape[0]
-                k = kaug // aug
-                if config_fit.protoloss:
-                    assert not config_fit.o_t_contr_proto_loss, 'only one of the proto losses should be used'
-                    opposite_proto_sim = opposite_proto_sim_in_aug(transformed_features, augmented_smasks, k, aug)
-                    if config_fit.debug and (epoch == config_fit.num_epochs - 1 or epoch == 0): print(
-                        'proto-sim intER-class transf<->transf', opposite_proto_sim.item())
-                    proto_loss = opposite_proto_sim
-                elif config_fit.selfattentionloss:
-                    proto_loss = self_attention_loss(original_features, transformed_features, augmented_smasks,
-                                                     augmented_smasks, k, aug)
-                    if config_fit.debug and (epoch == config_fit.num_epochs - 1 or epoch == 0): print(
-                        'self-att non-transf<->transformed bce', proto_loss.item())
-                elif config_fit.o_t_contr_proto_loss:
-                    o_t_contr_proto_loss = ctrstive_prototype_loss(original_features, transformed_features,
-                                                                   augmented_smasks, augmented_smasks, k, aug)
-                    if config_fit.debug and (epoch == config_fit.num_epochs - 1 or epoch == 0): print(
-                        'proto-contr non-transf<->transformed', o_t_contr_proto_loss.item())
-                    proto_loss = o_t_contr_proto_loss
-                else:
-                    proto_loss = 0
+            sloss = dense_info_nce_loss(original_features, transformed_features,
+                                        config_fit.nce) if config_fit.s_nceloss else 0
+            if config_fit.keepvarloss:
+                sloss += keep_var_loss(original_features, transformed_features)
 
-                if config_fit.debug and (epoch == config_fit.num_epochs - 1 or epoch == 0):
-                    proto_align_val = proto_align_val_measure(original_features, transformed_features, augmented_smasks, k,
-                                                              aug)
-                    print('proto-sim intRA-class non-transf<->transformed (for validation)', proto_align_val.item())
+            # 2. class-aware loss: opposite classes should get opposite features
+            # for prototype calculation, we want only one prototype per class
+            # so we average over features of entire k
+            # but calculate prototype for each augmentation individually [k*aug,c,h,w]->[aug,c,k*h*w]->[aug,c]
+            kaug, c, h, w = transformed_features.shape
+            aug = aug_qfeat_vols.shape[0]
+            k = kaug // aug
+            if config_fit.protoloss:
+                assert not config_fit.o_t_contr_proto_loss, 'only one of the proto losses should be used'
+                opposite_proto_sim = opposite_proto_sim_in_aug(transformed_features, augmented_smasks, k, aug)
+                if config_fit.debug and (epoch == config_fit.num_epochs - 1 or epoch == 0): print(
+                    'proto-sim intER-class transf<->transf', opposite_proto_sim.item())
+                proto_loss = opposite_proto_sim
+            elif config_fit.selfattentionloss:
+                proto_loss = self_attention_loss(original_features, transformed_features, augmented_smasks,
+                                                 augmented_smasks, k, aug)
+                if config_fit.debug and (epoch == config_fit.num_epochs - 1 or epoch == 0): print(
+                    'self-att non-transf<->transformed bce', proto_loss.item())
+            elif config_fit.o_t_contr_proto_loss:
+                o_t_contr_proto_loss = ctrstive_prototype_loss(original_features, transformed_features,
+                                                               augmented_smasks, augmented_smasks, k, aug)
+                if config_fit.debug and (epoch == config_fit.num_epochs - 1 or epoch == 0): print(
+                    'proto-contr non-transf<->transformed', o_t_contr_proto_loss.item())
+                proto_loss = o_t_contr_proto_loss
+            else:
+                proto_loss = 0
 
-                # 3. do not let only one image fit well - regularization
-                q_s_loss_diff = torch.abs(qloss - sloss) if config_fit.symmetricloss else 0
+            if config_fit.debug and (epoch == config_fit.num_epochs - 1 or epoch == 0):
+                proto_align_val = proto_align_val_measure(original_features, transformed_features, augmented_smasks, k,
+                                                          aug)
+                print('proto-sim intRA-class non-transf<->transformed (for validation)', proto_align_val.item())
 
-                # Aggregate loss
-                loss = qloss + sloss + q_s_loss_diff + proto_loss
-                assert loss.isfinite().all(), f"invalid contrastive loss:{loss}"
+            # 3. do not let only one image fit well - regularization
+            q_s_loss_diff = torch.abs(qloss - sloss) if config_fit.symmetricloss else 0
+
+#------------------------------------------------
+#            Nơi tổng hợp loss
+#------------------------------------------------
+
+            # Aggregate loss
+            # loss = qloss + sloss + q_s_loss_diff + proto_loss
+
+            loss = qloss + sloss + q_s_loss_diff + (1.5 * proto_loss) # loss giúp tăng cho lung
+            
+            assert loss.isfinite().all(), f"invalid contrastive loss:{loss}"
 
             # Backpropagation and optimization
             if config_fit.debug and (epoch == config_fit.num_epochs - 1 or epoch == 0):
                 def gradient_magnitude(loss_term):
                     optimizer.zero_grad()
-                    scaler.scale(loss_term).backward(retain_graph=True)
-                    scaler.unscale_(optimizer)
+                    loss_term.backward(retain_graph=True)
                     magn = torch.abs(self.conv.weight.grad.mean()) + torch.abs(self.linear.weight.grad.mean())
                     return magn
 
@@ -329,22 +576,11 @@ class ContrastiveFeatureTransformer(nn.Module):
                                               proto_loss_grad_magnitude=proto_loss_grad_magnitude,
                                               q_s_loss_diff_grad_magnitude=q_s_loss_diff_grad_magnitude))
 
-            optimizer.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
             if config_fit.debug and epoch % 10 == 0: print('loss', loss.detach())
-
-            # Early stopping: stop if loss doesn't improve by min_delta for patience epochs
-            current_loss = loss.item()
-            if best_loss - current_loss > early_stop_min_delta:
-                best_loss = current_loss
-                patience_counter = 0
-            else:
-                patience_counter += 1
-                if patience_counter >= early_stop_patience:
-                    break
 
 
 import numpy as np
@@ -529,7 +765,6 @@ class CTrBuilder:
 
             contrastive_head.fit(mapped_qfeat, qfeataug, mapped_sfeat, sfeataug,
                                  segutils.downsample_mask(s_aug_mask, h, w), self.config.fitting)
-            contrastive_head.eval()
 
             contrastive_transformers.append(contrastive_head)
             # show how support image and its augmentations would produce a affinity map
@@ -549,17 +784,16 @@ class CTrBuilder:
         if (self.ctrs == None): print("error: call buildContrastiveTransformers() first")
         task_adapted_feats = []
 
-        with torch.no_grad():
-            for idx in range(len(layerwise_feats)):
-                if idx < self.config.featext.l0:
-                    task_adapted_feats.append(None)
-                else:
-                    input_shape = layerwise_feats[idx].shape
-                    idxth_feat = layerwise_feats[idx].view(-1, *input_shape[-3:])
-                    forward_pass_res = self.ctrs[idx - self.config.featext.l0](idxth_feat)
-                    target_shape = *input_shape[:-3], *forward_pass_res.shape[
-                                                       -3:]  # borrow channel dim from result, but bsz,k dims from input
-                    task_adapted_feats.append(forward_pass_res.view(target_shape))
+        for idx in range(len(layerwise_feats)):
+            if idx < self.config.featext.l0:
+                task_adapted_feats.append(None)
+            else:
+                input_shape = layerwise_feats[idx].shape
+                idxth_feat = layerwise_feats[idx].view(-1, *input_shape[-3:])
+                forward_pass_res = self.ctrs[idx - self.config.featext.l0](idxth_feat)
+                target_shape = *input_shape[:-3], *forward_pass_res.shape[
+                                                   -3:]  # borrow channel dim from result, but bsz,k dims from input
+                task_adapted_feats.append(forward_pass_res.view(target_shape))
 
         return task_adapted_feats
 
