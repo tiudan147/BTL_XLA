@@ -14,9 +14,9 @@ class ContrastiveConfig:
             self._data = {
                 'aug': {
                     'n_transformed_imgs': 2,
-                    'blurkernelsize': [1],  # chooses one of this kernel sizes
-                    'maxjitter': 0.0,
-                    'maxangle': 0,  # rotation
+                    'blurkernelsize': [3],  # chooses one of this kernel sizes
+                    'maxjitter': 0.2,
+                    'maxangle': 15,  # rotation
                     # 'translate': (0,0),  # BE CAREFUL WITH TRANSLATE - if you apply it on the feature volume that has smaller spatial dims correspondences break
                     'maxscale': 1.0,  # 1.0 = No scaling
                     'maxshear': 20,
