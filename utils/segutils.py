@@ -342,7 +342,7 @@ def guided_filter(rgb_image, probability, radius=8, eps=1e-3):
         guide_products.flatten(1, 2), radius
     ).view(guide.shape[0], 3, 3, *guide.shape[-2:])
     covariance_guide = covariance_guide - mean_guide.unsqueeze(2) * mean_guide.unsqueeze(1)
-    covariance_guide_probability = _box_filter(guide * probability) - mean_guide * mean_probability
+    covariance_guide_probability = _box_filter(guide * probability, radius) - mean_guide * mean_probability
 
     covariance_guide = covariance_guide.permute(0, 3, 4, 1, 2)
     covariance_guide_probability = covariance_guide_probability.permute(0, 2, 3, 1).unsqueeze(-1)

@@ -25,3 +25,6 @@ docs/ABCDFSS.md
 
 datasets/
 datasets/
+
+# Experiment cache (layer predictions can be many GB)
+experiments/cache/
