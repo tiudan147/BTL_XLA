@@ -1,0 +1,12 @@
+group,shot,seed,name,fusion,fusion_params,threshold,threshold_params,postproc,postproc_params,mIoU,FB-IoU,FG_pred,FG_gt,n_episodes,seconds,per_class_iou,note
+B,1,0,B0_pred_mean,mean,{},pred_mean,{},none,{},79.8215,86.4108,23.7765,25.0763,600,0.917,"{""0"": 79.82152981640533}","max(mean, Otsu) baseline"
+B,1,0,B1_mean,mean,{},mean,{},none,{},66.6211,75.1652,36.2906,25.0763,600,0.278,"{""0"": 66.62105945580988}",mean threshold
+B,1,0,B2_otsus,mean,{},otsus,{},none,{},79.8215,86.4108,23.7765,25.0763,600,0.809,"{""0"": 79.82152981640533}",pure Otsu
+B,1,0,B3_multi_otsu,mean,{},multi_otsu,"{""classes"": 3}",none,{},61.2439,74.8073,15.7961,25.0763,600,7.099,"{""0"": 61.24394556208427}","3-class Otsu, highest class"
+B,1,0,B4_quantile_support,mean,{},quantile_support,{},none,{},72.2299,80.9236,25.6245,25.0763,600,6.028,"{""0"": 72.22985817115871}",quantile at support foreground ratio
+B,1,0,B5_adaptive_local,mean,{},adaptive_local,"{""block_size"": 31, ""C"": 0.0}",none,{},33.7697,49.7696,33.7876,25.0763,600,1.035,"{""0"": 33.769737677795156}",local Gaussian adaptive threshold
+B,1,0,B6_lambda0,mean,{},lambda,"{""lambda"": 0.0}",none,{},66.6211,75.1652,36.2906,25.0763,600,0.873,"{""0"": 66.62105945580988}","lambda*Otsu + (1-lambda)*mean, lambda=0"
+B,1,0,B6_lambda0.25,mean,{},lambda,"{""lambda"": 0.25}",none,{},73.7751,81.2246,31.8392,25.0763,600,0.826,"{""0"": 73.77513210887466}","lambda*Otsu + (1-lambda)*mean, lambda=0.25"
+B,1,0,B6_lambda0.5,mean,{},lambda,"{""lambda"": 0.5}",none,{},78.5785,85.0843,28.5037,25.0763,600,0.808,"{""0"": 78.57852245976231}","lambda*Otsu + (1-lambda)*mean, lambda=0.5"
+B,1,0,B6_lambda0.75,mean,{},lambda,"{""lambda"": 0.75}",none,{},80.5301,86.7052,25.9221,25.0763,600,0.808,"{""0"": 80.5301064181975}","lambda*Otsu + (1-lambda)*mean, lambda=0.75"
+B,1,0,B6_lambda1,mean,{},lambda,"{""lambda"": 1.0}",none,{},79.8215,86.4108,23.7765,25.0763,600,0.8,"{""0"": 79.82152981640533}","lambda*Otsu + (1-lambda)*mean, lambda=1"
