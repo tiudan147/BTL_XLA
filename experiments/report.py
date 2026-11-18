@@ -249,6 +249,22 @@ def generate(
         base_row_c = base_row_a
     base_row_a = base_row_a or {"name": base_a, "mIoU": 0, "FB-IoU": 0, "FG_pred": 0}
 
+    def _avg_row(group: str, name: str, fallback: Dict[str, Any]) -> Dict[str, Any]:
+        miou = avg_metric(indexed.get(group, {}), name, "mIoU")
+        fb = avg_metric(indexed.get(group, {}), name, "FB-IoU")
+        fg = avg_metric(indexed.get(group, {}), name, "FG_pred")
+        if miou is None:
+            return fallback
+        return {
+            "name": name,
+            "mIoU": miou,
+            "FB-IoU": fb if fb is not None else 0.0,
+            "FG_pred": fg if fg is not None else 0.0,
+        }
+
+    base_avg_a = _avg_row("A", base_a, base_row_a)
+    base_avg_c = _avg_row("C", base_c, base_row_c)
+
     # Episode counts / protocol
     meta = None
     for b in BENCHMARKS:
@@ -306,11 +322,11 @@ def generate(
     lines.append(
         "\n† C0 dùng tập con CRF (xem mục 6.0); A0/A0+B0+C1 dùng toàn bộ episode đã cache."
     )
-    if base_row_a and base_row_c:
+    if base_avg_a and base_avg_c:
         lines.append(
-            f"\nBaseline no-pp trung bình 5 tập: **{float(base_row_a['mIoU']):.2f} / "
-            f"{float(base_row_a['FB-IoU']):.2f}**; baseline đầy đủ: **"
-            f"{float(base_row_c['mIoU']):.2f} / {float(base_row_c['FB-IoU']):.2f}**.\n"
+            f"\nBaseline no-pp trung bình 5 tập: **{float(base_avg_a['mIoU']):.2f} / "
+            f"{float(base_avg_a['FB-IoU']):.2f}**; baseline đầy đủ: **"
+            f"{float(base_avg_c['mIoU']):.2f} / {float(base_avg_c['FB-IoU']):.2f}**.\n"
         )
 
     # Group tables
@@ -328,7 +344,7 @@ def generate(
                     break
             baseline_for_group = baseline_for_group or base_row_a
         else:
-            baseline_for_group = base_row_a
+            baseline_for_group = base_avg_a
         lines.append(
             table_group(
                 group,
@@ -393,8 +409,15 @@ def generate(
         "trung bình ± độ lệch chuẩn (xem mục 7 của README).\n"
         "- Deepglobe có nhãn nhiễu; chênh lệch nhỏ trên tập này không nên diễn giải quá mức.\n"
     )
+    lines.append("\n### 6.9 Commit của từng nhóm\n")
+    lines.append("| Nhóm | Commit |\n|---|---|")
+    for group in GROUPS:
+        if group in commits:
+            lines.append(f"| {GROUP_TITLE[group]} | {commit_cell(commits, group)} |")
+    if code_commit and code_commit != "unknown":
+        lines.append(f"| Code pipeline | [{code_commit[:8]}]({common.commit_link(code_commit)}) |")
     lines.append(
-        "\n### 6.9 Cách chạy lại\n"
+        "\n### 6.10 Cách chạy lại\n"
         "\n```bash\n"
         "# 1. Cache adapter + 13 layer predictions (một lần cho mỗi tập/shot/seed)\n"
         "python -m experiments.cache_features --benchmark lung --datapath /path/to/lungsegmentation \\\n"

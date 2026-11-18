@@ -43,8 +43,12 @@ class AverageMeter:
         self.loss_buf = []
 
     def update(self, inter_b, union_b, class_id, loss):
-        self.intersection_buf.index_add_(1, class_id, inter_b.float())
-        self.union_buf.index_add_(1, class_id, union_b.float())
+        # index_add_ requires an index tensor and source shaped like the
+        # destination except along the indexed dimension.  Accept scalar or
+        # one-element class ids (the original code relied on old broadcasting).
+        class_id = torch.as_tensor(class_id).reshape(-1)
+        self.intersection_buf.index_add_(1, class_id, inter_b.float().reshape(2, -1))
+        self.union_buf.index_add_(1, class_id, union_b.float().reshape(2, -1))
         if loss is None:
             loss = torch.tensor(0.0)
         self.loss_buf.append(loss)
