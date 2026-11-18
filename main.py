@@ -12,7 +12,7 @@ def parse_opts():
     parser.add_argument('--adapt-to', type=str, default='first-episode', choices=['first-episode', 'every-episode'])
     parser.add_argument(
         '--fusion-method', type=str, default='mean',
-        choices=['mean', 'low', 'mid', 'high', 'stage_uniform', 'low_biased', 'high_biased'],
+        choices=['mean', 'geomean', 'low', 'mid', 'high', 'stage_uniform', 'low_biased', 'high_biased'],
         help='How to combine the 13 ResNet50 layer predictions',
     )
     parser.add_argument(

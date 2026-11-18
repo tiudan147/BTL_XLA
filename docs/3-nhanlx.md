@@ -76,7 +76,23 @@ python main.py --benchmark fss --datapath ./datasets/fss/ --nshot 1 \
   --fusion-method high_biased --threshold-method otsus --postprocessing guided
 ```
 
-- `--fusion-method`: `mean`, `low`, `mid`, `high`, `stage_uniform`, `low_biased`, `high_biased`.
+- `--fusion-method`: `mean`, `geomean`, `low`, `mid`, `high`, `stage_uniform`, `low_biased`, `high_biased`.
 - `--threshold-method`: `otsus`, `mean`, `pred_mean`.
 - `--postprocessing`: `off`, `always`, `dynamic`, `guided`, `morph-open`, `morph-close`, `morph-open-close`.
 - Dùng `--help` để xem mô tả tham số; chạy từng cấu hình trên cùng benchmark/episode/seed để lập bảng ablation. Kết quả benchmark đầy đủ cần được chạy trong môi trường đã cài dependencies và dữ liệu tương ứng.
+
+## 6. Cấu hình tốt hơn baseline (từ `experiments/results`)
+
+Kết quả 1-shot, seed 0, 600 episode/tập (nhóm C: 200 episode Deepglobe). Baseline
+tự chạy: A0+B0+C1 = **54.42 / 64.87**; A0+B0+C0 = **42.63 / 47.57** (Deepglobe).
+
+| Nhóm | Biến thể | ΔmIoU | ΔFB-IoU | Cách chạy |
+|---|---|---|---|---|
+| A | `A8_geomean` — trung bình hình học 13 tầng | +0.19 | −0.23 | `--fusion-method geomean` |
+| B | `B2_otsus` — Otsu thuần | +0.36 | −0.23 | `--threshold-method otsus` |
+| C | `C2_crf_always` — DenseCRF luôn bật | +0.23 | +0.73 | `--postprocessing always` |
+
+`A8_geomean` và `B2_otsus` tăng mIoU nhưng giảm nhẹ FB-IoU (trong ngưỡng ±0.3);
+`C2_crf_always` tăng cả hai chỉ số nhưng mới đo trên Deepglobe. Mặc định vẫn giữ
+F0/T-PredMean/P0 theo quy tắc không tinh chỉnh trên nhãn test; các biến thể trên
+chỉ dùng khi chạy ablation có kiểm soát. Chi tiết đầy đủ ở `docs/exp.md`.

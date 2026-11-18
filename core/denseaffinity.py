@@ -58,7 +58,7 @@ def upsample(volume, h, w):
 class DAMatComparison:
 
     FUSION_METHODS = {
-        'mean', 'low', 'mid', 'high', 'stage_uniform', 'low_biased', 'high_biased'
+        'mean', 'geomean', 'low', 'mid', 'high', 'stage_uniform', 'low_biased', 'high_biased'
     }
     STAGE_SLICES = (slice(0, 4), slice(4, 10), slice(10, 13))
     STAGE_WEIGHTS = {
@@ -89,6 +89,9 @@ class DAMatComparison:
             raise ValueError('Layer predictions must have shape [B, layers, H, W]')
         if fusion_method == 'mean':
             return q_pred_coarses_t.mean(dim=1)
+        if fusion_method == 'geomean':
+            # Geometric mean in log space; clamp keeps zero-scored pixels finite.
+            return torch.exp(torch.log(q_pred_coarses_t.clamp_min(1e-6)).mean(dim=1))
         if q_pred_coarses_t.shape[1] != 13:
             raise ValueError(
                 f"Fusion method {fusion_method!r} requires 13 layer predictions; "
