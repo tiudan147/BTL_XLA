@@ -224,27 +224,7 @@ Quy ước đặt tên: `expXX_<nhóm><số>_<mô_tả>` (ví dụ `exp03_A2_mid
 
 ---
 
-## 9. Phân công & hướng dẫn chạy lại
-
-### 9.1 Phân công
-| Thành viên | Phần phụ trách |
-|---|---|
-| _(tên)_ | Khâu đầu ra: gộp tầng, cắt ngưỡng, hậu xử lý (tài liệu này) |
-| _(tên)_ | Adapter & hàm mất mát |
-| _(tên)_ | Đánh giá, báo cáo tổng hợp |
-
-### 9.2 Chạy lại
-1. Clone mã nguồn gốc và cài môi trường theo README của repo (PyTorch, `pydensecrf`, OpenCV, scikit-image).
-2. Tải các tập dữ liệu CD-FSS benchmark và SUIM, đặt đúng đường dẫn theo README.
-3. Chạy baseline, **lưu lại** 13 bản đồ `q̂_pred_l` cho mỗi episode.
-4. Chạy các script thí nghiệm nhóm A/B/C trên dữ liệu đã lưu.
-5. Ghi cấu hình (seed, siêu tham số, commit) vào bảng nhật ký ở mục 6.
-
-**Ghi nhận phiên bản:** Python, PyTorch, CUDA, phần cứng (bài báo dùng Tesla P100 để đo thời gian), seed, commit hash của repo gốc.
-
----
-
-## 10. Tài liệu tham khảo chính
+## 9. Tài liệu tham khảo chính
 
 - Herzog, J. *Adapt Before Comparison: A New Perspective on Cross-Domain Few-Shot Segmentation.* arXiv:2402.17614v2, 2024.
 - Shi et al. *DCAMA: Dense Cross-Query-and-Support Attention Weighted Mask Aggregation for Few-Shot Segmentation.* ECCV 2022. (cơ chế tương quan chéo)

@@ -81,7 +81,7 @@ python main.py --benchmark fss --datapath ./datasets/fss/ --nshot 1 \
 - `--postprocessing`: `off`, `always`, `dynamic`, `guided`, `morph-open`, `morph-close`, `morph-open-close`.
 - Dùng `--help` để xem mô tả tham số; chạy từng cấu hình trên cùng benchmark/episode/seed để lập bảng ablation. Kết quả benchmark đầy đủ cần được chạy trong môi trường đã cài dependencies và dữ liệu tương ứng.
 
-## 6. Cấu hình tốt hơn baseline (từ `experiments/results`)
+## 6. Cấu hình tốt hơn baseline
 
 Kết quả 1-shot, seed 0, 600 episode/tập (nhóm C: 200 episode Deepglobe). Baseline
 tự chạy: A0+B0+C1 = **54.42 / 64.87**; A0+B0+C0 = **42.63 / 47.57** (Deepglobe).
