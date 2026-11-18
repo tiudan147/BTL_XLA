@@ -44,7 +44,9 @@ def crf_is_good(sseval):
     for i in range(len(pred_maps)):
         pred_map = pred_maps[i:i + 1]
         # display(segutils.tensor_table(pred_map=pred_map))
-        fthresh = segutils.thresh_fn(sseval.thresh_method)
+        fthresh = segutils.thresh_fn(
+            sseval.thresh_method, getattr(sseval, 'threshold_otsu_weight', 0.5)
+        )
         thresh = fthresh(pred_map, s_maskaug)[0]
 
         pred_mask = (pred_map > thresh).float()

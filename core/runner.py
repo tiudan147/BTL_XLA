@@ -75,6 +75,7 @@ class SingleSampleEval:
         self.batch = batch
         self.feat_maker = feat_maker
         self.thresh_method = getattr(args, 'threshold_method', 'pred_mean')
+        self.threshold_otsu_weight = getattr(args, 'threshold_otsu_weight', 0.5)
         self.post_proc_method = 'off'
         self.verbosity = args.verbosity
         self.selected_fusion_method = None
@@ -159,7 +160,9 @@ class SingleSampleEval:
         return best
 
     def thresh_method_fn(self, fused_pred, s_masks):
-        return segutils.calcthresh(fused_pred, s_masks, self.thresh_method)
+        return segutils.calcthresh(
+            fused_pred, s_masks, self.thresh_method, self.threshold_otsu_weight
+        )
 
     def compare_feats(self):
         if self.task_adapted is None:
@@ -180,7 +183,9 @@ class SingleSampleEval:
             print("error, calculate logit mask first (do forward pass)")
         if method is None:
             method = self.thresh_method
-        self.thresh = segutils.calcthresh(self.logit_mask, self.s_mask, method)
+        self.thresh = segutils.calcthresh(
+            self.logit_mask, self.s_mask, method, self.threshold_otsu_weight
+        )
         self.pred_mask = (self.logit_mask > self.thresh.reshape(-1, 1, 1)).float()
         return self.thresh, self.pred_mask
 
@@ -189,17 +194,25 @@ class SingleSampleEval:
             return self.pred_mask
         elif self.post_proc_method == 'always':
             return crfutils.apply_crf(
-                self.q_img, self.logit_mask, segutils.thresh_fn(self.thresh_method)
+                self.q_img, self.logit_mask,
+                segutils.thresh_fn(self.thresh_method, self.threshold_otsu_weight)
             ).to(self.device)
         elif self.post_proc_method == 'dynamic':
             if crfutils.crf_is_good(self):
                 return crfutils.apply_crf(
-                    self.q_img, self.logit_mask, segutils.thresh_fn(self.thresh_method)
+                    self.q_img, self.logit_mask,
+                    segutils.thresh_fn(self.thresh_method, self.threshold_otsu_weight)
                 ).to(self.device)
             return self.pred_mask
-        elif self.post_proc_method == 'guided':
+        elif self.post_proc_method == 'guided' or self.post_proc_method.startswith('guided-morph-'):
             refined = segutils.guided_filter(self.q_img, self.logit_mask)
-            return (refined > self.thresh[:, None, None]).float()
+            refined_thresh = self.thresh_method_fn(refined, self.s_mask)
+            self.thresh = refined_thresh
+            refined_mask = (refined > refined_thresh[:, None, None]).float()
+            if self.post_proc_method == 'guided':
+                return refined_mask
+            operation = self.post_proc_method[len('guided-morph-'):].replace('-', '_')
+            return segutils.morphological_filter(refined_mask, operation)
         elif self.post_proc_method in {'morph-open', 'morph-close', 'morph-open-close'}:
             operation = self.post_proc_method[len('morph-'):].replace('-', '_')
             return segutils.morphological_filter(self.pred_mask, operation)

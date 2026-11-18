@@ -11,38 +11,34 @@ Phạm vi: từ đặc trưng query/support đã thích ứng đến mặt nạ 
 
 ## 2. Kế hoạch thực nghiệm
 
-### 2.1. Gộp tầng (layer fusion)
+### 2.1. Cải tiến gộp tầng (layer fusion)
 
-Giữ nguyên bước tính affinity và nội suy; chỉ thay cách tổng hợp các bản đồ dự đoán. Chia 13 feature map đang dùng theo stage ResNet50: **Low** gồm 4 map thuộc `layer2`, **Mid** gồm 6 map thuộc `layer3`, **High** gồm 3 map thuộc `layer4`.
+Sau khi tính affinity và nội suy, hệ thống gộp 13 bản đồ dự đoán của ResNet50. Các map được chia thành ba nhóm: **Low** (4 map), **Mid** (6 map) và **High** (3 map). Baseline `mean` lấy trung bình đều; các chế độ mới cho phép chọn nhóm, đặt trọng số theo stage hoặc giảm ảnh hưởng của map không đồng thuận.
 
-Chạy các cấu hình sau:
+- `low`, `mid`, `high`: chỉ dùng trung bình của nhóm tương ứng; `stage_uniform`, `low_biased`, `high_biased`, `high_suppressed`: gộp trung bình theo stage với trọng số khác nhau.
+- `weighted_stage` và `weighted_stage_geomean`: gộp stage theo trọng số tùy chỉnh `--stage-weights WL WM WH`.
+- `geomean`: trung bình hình học 13 map; `trimmed_mean`: loại các giá trị thấp/cao nhất theo từng pixel để giảm ảnh hưởng ngoại lệ.
+- `agreement`: tự giảm trọng số stage bất đồng với đồng thuận giữa các stage. `pseudo_gate` chấm các phương pháp trên pseudo-episode từ support rồi chọn phương pháp có IoU cao nhất cho episode, không dùng nhãn query.
 
-| Mã | Cấu hình tổng hợp |
-|---|---|
-| F0 | Baseline: trung bình đều cả 13 map |
-| F1 | Trung bình 4 map Low |
-| F2 | Trung bình 6 map Mid |
-| F3 | Trung bình 3 map High |
-| F4 | Trung bình theo stage với trọng số Low/Mid/High = 1/3, 1/3, 1/3 |
-| F5 | Nghiêng tầng nông: trọng số = 0.5, 0.3, 0.2 |
-| F6 | Nghiêng tầng sâu: trọng số = 0.2, 0.3, 0.5 |
-
-Với F4–F6, trước tiên lấy trung bình các map trong từng stage, sau đó nhân trọng số stage (tổng trọng số bằng 1). So sánh F4 với F0 để tách ảnh hưởng của cân bằng theo stage khỏi ảnh hưởng của trọng số thiên nông/sâu.
+Ví dụ: `python main.py --benchmark fss --datapath ./datasets/fss/ --fusion-method pseudo_gate`. Có thể chỉ định ứng viên bằng `--fusion-candidates`; mặc định là `mean,high_suppressed,geomean,trimmed_mean,agreement`. Phép gộp không thay đổi backbone hay bước tính affinity.
 
 ### 2.2. Cắt ngưỡng và hậu xử lý
 
-Trên cùng một cấu hình fusion (dùng F0 làm baseline), đối chiếu ba ngưỡng:
+Ngưỡng được tính riêng cho mỗi bản đồ dự đoán; pixel được gán foreground khi `prediction > threshold`:
 
-- **T-Otsu:** dùng Otsu như nhánh `otsus` hiện có.
-- **T-Mean:** dùng trung bình số học của toàn bộ bản đồ xác suất, không kết hợp Otsu.
-- **T-PredMean:** giữ nguyên baseline hiện tại `max(Otsu, mean)` để đo tác động của việc thay đổi so với cấu hình dự án.
+- `mean`: trung bình số học của bản đồ xác suất.
+- `otsus`: Otsu trên bản đồ được chuẩn hóa về `[0, 255]`; các pixel dưới 5% dải cường độ bị bỏ khỏi bước ước lượng ngưỡng.
+- `pred_mean` (mặc định): `max(Otsu, mean)`, giúp so sánh trực tiếp với hai thành phần riêng lẻ.
+- `otsu_mean` (B6): `λ × Otsu + (1 − λ) × mean`; cấu hình `λ` bằng `--threshold-otsu-weight` (mặc định `0.5`, miền `[0, 1]`). `λ=1` tương đương Otsu, `λ=0` tương đương Mean.
+
+Đánh giá các lựa chọn trên cùng cấu hình fusion và episode; giữ `pred_mean` làm baseline, không chọn `λ` dựa trên nhãn query.
 
 Với mỗi ngưỡng, so sánh các nhánh hậu xử lý sau trên cùng dự đoán xác suất và ảnh query:
 
 - **P0 — Tắt:** không tinh chỉnh sau khi cắt ngưỡng.
 - **P1 — DenseCRF:** chạy luôn (`always`); chạy `dynamic` như một chế độ riêng để đánh giá cơ chế quyết định có tinh chỉnh hay không. Giữ nguyên cấu hình CRF hiện có.
-- **P2 — Guided Filter:** lọc bản đồ xác suất bằng ảnh query RGB đã chuẩn hóa, bán kính 8 pixel và `eps=1e-3`, sau đó áp dụng đúng ngưỡng của nhánh tương ứng.
-- **P3 — Morphology:** thực hiện opening 3×3 một lần, closing 3×3 một lần và opening→closing như ba biến thể riêng trên mask nhị phân; không thay đổi ngưỡng đầu vào.
+- **P2 — Guided Filter:** lọc bản đồ xác suất bằng ảnh query RGB đã chuẩn hóa, bán kính 8 pixel và `eps=1e-3`, sau đó tính lại ngưỡng theo phương pháp đã chọn.
+- **P3 — Morphology:** thực hiện opening 3×3, closing 3×3 hoặc opening→closing trên mask nhị phân. Có thể ghép Guided Filter → cắt ngưỡng → morphology bằng các chế độ `guided-morph-*`.
 
 Chạy ablation từng yếu tố trước (fusion, ngưỡng, hậu xử lý), rồi mới chạy các tổ hợp của cấu hình fusion tốt nhất với ba ngưỡng và các nhánh hậu xử lý. Không chọn cấu hình bằng cách nhìn vào ground-truth của tập đang báo cáo.
 
@@ -76,9 +72,9 @@ python main.py --benchmark fss --datapath ./datasets/fss/ --nshot 1 \
   --fusion-method high_biased --threshold-method otsus --postprocessing guided
 ```
 
-- `--fusion-method`: `mean`, `geomean`, `low`, `mid`, `high`, `stage_uniform`, `low_biased`, `high_biased`.
-- `--threshold-method`: `otsus`, `mean`, `pred_mean`.
-- `--postprocessing`: `off`, `always`, `dynamic`, `guided`, `morph-open`, `morph-close`, `morph-open-close`.
+- `--fusion-method`: `mean`, `geomean`, `trimmed_mean`, `low`, `mid`, `high`, `stage_uniform`, `low_biased`, `high_biased`, `high_suppressed`, `weighted_stage`, `weighted_stage_geomean`, `agreement`, `pseudo_gate`.
+- `--threshold-method`: `otsus`, `mean`, `pred_mean`, `otsu_mean`; `--threshold-otsu-weight` cấu hình λ cho `otsu_mean`.
+- `--postprocessing`: `off`, `always`, `dynamic`, `guided`, `morph-open`, `morph-close`, `morph-open-close`, `guided-morph-open`, `guided-morph-close`, `guided-morph-open-close`.
 - Dùng `--help` để xem mô tả tham số; chạy từng cấu hình trên cùng benchmark/episode/seed để lập bảng ablation. Kết quả benchmark đầy đủ cần được chạy trong môi trường đã cài dependencies và dữ liệu tương ứng.
 
 ## 6. Cấu hình tốt hơn baseline

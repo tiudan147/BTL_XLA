@@ -38,13 +38,21 @@ def parse_opts():
     )
     parser.add_argument(
         '--threshold-method', type=str, default='pred_mean',
-        choices=['otsus', 'mean', 'pred_mean'],
-        help='Threshold for converting foreground probabilities to a binary mask',
+        choices=['otsus', 'mean', 'pred_mean', 'otsu_mean'],
+        help='Threshold method; otsu_mean blends Otsu and mean using --threshold-otsu-weight',
+    )
+    parser.add_argument(
+        '--threshold-otsu-weight', type=float, default=0.5,
+        help='Otsu weight for otsu_mean thresholding (lambda in [0, 1])',
     )
     parser.add_argument(
         '--postprocessing', type=str, default='off',
-        choices=['off', 'dynamic', 'always', 'guided', 'morph-open', 'morph-close', 'morph-open-close'],
-        help='Optional refinement after thresholding; dynamic/always use DenseCRF',
+        choices=[
+            'off', 'dynamic', 'always', 'guided', 'morph-open', 'morph-close',
+            'morph-open-close', 'guided-morph-open', 'guided-morph-close',
+            'guided-morph-open-close',
+        ],
+        help='Optional refinement; guided-morph variants apply guided filtering before morphology',
     )
     parser.add_argument('--logpath', type=str, default='./logs')
     parser.add_argument('--verbosity', type=int, default=0)

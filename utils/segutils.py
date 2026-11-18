@@ -230,22 +230,29 @@ def iterative_otsus(probab_mask, s_mask, maxiters=5, mode='ordinary',
         it += 1
 
 
-def calcthresh(fused_pred, s_masks, method='otsus'):
+def calcthresh(fused_pred, s_masks, method='otsus', otsu_weight=0.5):
     mean_thresh = fused_pred.mean(dim=(-2, -1))
     if method == 'mean':
         return mean_thresh
     if method == 'otsus':
         thresh = otsus(fused_pred)[0]
         return thresh
-    elif method == 'pred_mean':
+    if method == 'otsu_mean':
+        if not 0 <= otsu_weight <= 1:
+            raise ValueError('otsu_weight must be between 0 and 1')
+        otsu_thresh = otsus(fused_pred)[0]
+        return otsu_weight * otsu_thresh + (1 - otsu_weight) * mean_thresh
+    if method == 'pred_mean':
         otsu_thresh = otsus(fused_pred)[0]
         return torch.maximum(otsu_thresh, mean_thresh)
-    raise ValueError("Unknown threshold method {!r}; choose from 'otsus', 'mean', 'pred_mean'".format(method))
+    raise ValueError(
+        "Unknown threshold method {!r}; choose from 'otsus', 'mean', 'pred_mean', 'otsu_mean'".format(method)
+    )
 
 
-def thresh_fn(method):
+def thresh_fn(method, otsu_weight=0.5):
     def inner(fused_pred, s_masks=None):
-        return calcthresh(fused_pred, s_masks, method)
+        return calcthresh(fused_pred, s_masks, method, otsu_weight)
 
     return inner
 
@@ -368,10 +375,12 @@ def _morphology(mask, operation, kernel_size=3):
     padding = kernel_size // 2
 
     def dilate(value):
-        return F.max_pool2d(value, kernel_size, stride=1, padding=padding)
+        value = F.pad(value, (padding, padding, padding, padding), value=0)
+        return F.max_pool2d(value, kernel_size, stride=1)
 
     def erode(value):
-        return -F.max_pool2d(-value, kernel_size, stride=1, padding=padding)
+        value = F.pad(value, (padding, padding, padding, padding), value=1)
+        return -F.max_pool2d(-value, kernel_size, stride=1)
 
     if operation == 'open':
         result = dilate(erode(mask.float()))

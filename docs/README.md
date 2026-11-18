@@ -156,7 +156,7 @@ Ký hiệu nhóm: **L** = tầng 1–4, **M** = tầng 5–10, **H** = tầng 11
 | B3 | Otsu đa mức (multi-Otsu, 3 lớp) rồi lấy lớp cao nhất | Xử lý được lớp "không rõ" ở giữa |
 | B4 | Ngưỡng theo phân vị, tỉ lệ foreground ước lượng từ `mean(Mˢ)` của support | Dùng tiên nghiệm tỉ lệ foreground, nhưng tỉ lệ foreground query có thể khác support |
 | B5 | Ngưỡng cục bộ/thích ứng (adaptive threshold) | Có thể tốt cho ảnh có độ sáng/độ tương phản không đều, nhưng dễ nhiễu |
-| B6 | Ngưỡng `λ·otsu + (1−λ)·mean` với λ ∈ [0,1] | Nội suy giữa hai thái cực; tìm λ ổn định |
+| B6 | `otsu_mean`: `λ·otsu + (1−λ)·mean`, λ ∈ [0,1] (`--threshold-otsu-weight`, mặc định 0.5) | Đã triển khai; nội suy giữa hai thái cực |
 
 ### 5.3 Nhóm C — Hậu xử lý
 
@@ -167,7 +167,7 @@ Ký hiệu nhóm: **L** = tầng 1–4, **M** = tầng 5–10, **H** = tầng 11
 | C2 | DenseCRF luôn bật | Giúp FSS-1000/ISIC, hại Chest X-ray (bài báo nói CRF hầu như không có lợi ở X-ray) |
 | C3 | Guided Filter (ảnh RGB query làm guide) làm mượt `q̂_fused` **trước** khi cắt ngưỡng | Làm biên bám cạnh ảnh, nhanh hơn CRF; có thể thay thế CRF |
 | C4 | Phép toán hình thái: opening (khử nhiễu hạt), closing (lấp lỗ), loại bỏ thành phần liên thông nhỏ, lấp lỗ (hole filling) | Khử vùng dương tính giả lẻ tẻ (như Hình 11, cột w/o TA), nhưng có thể xóa mất đối tượng nhỏ (như cá nhỏ ở Hình 9c) |
-| C5 | Guided Filter → ngưỡng → hình thái | Kết hợp, kỳ vọng tốt nhất trong nhóm không dùng CRF |
+| C5 | Guided Filter → ngưỡng → hình thái (`guided-morph-open`, `guided-morph-close`, `guided-morph-open-close`) | Đã triển khai; kết hợp lọc theo ảnh với tinh chỉnh mask |
 | C6 | Cơ chế bật/tắt động (Thuật toán 1) áp dụng cho **mỗi** phương pháp C3–C5 | Quyết định bằng pseudo-episode có thể giúp mỗi phương pháp chỉ hoạt động khi có lợi |
 
 **Triển khai gợi ý:** Guided Filter có sẵn trong `cv2.ximgproc.guidedFilter` (cần `opencv-contrib-python`); hình thái học dùng `cv2.morphologyEx`/`scipy.ndimage`/`skimage.morphology`. Kích thước kernel và bán kính cần được xem là siêu tham số phụ thuộc độ phân giải ảnh.
