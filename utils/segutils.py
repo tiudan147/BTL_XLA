@@ -1,4 +1,3 @@
-import os
 import cv2
 import numpy as np
 import torch
@@ -175,11 +174,17 @@ def otsus(batched_tensor_image, drop_least=0.05, mode='ordinary'):
 
     for i in range(bsz):
         # Convert the tensor to numpy array
-        numpy_image = batched_tensor_image[i].cpu().numpy()
+        numpy_image = batched_tensor_image[i].detach().cpu().numpy()
 
         # Rescale to [0, 255] and convert to uint8 type for OpenCV compatibility
         npmin, npmax = numpy_image.min(), numpy_image.max()
-        numpy_image = (norm(numpy_image) * 255).astype(np.uint8)
+        if npmax == npmin:
+            binary_tensors.append(torch.zeros_like(batched_tensor_image[i].detach().cpu()).float())
+            thresholds.append(torch.tensor(
+                npmin, device=batched_tensor_image.device, dtype=batched_tensor_image.dtype
+            ))
+            continue
+        numpy_image = ((numpy_image - npmin) / (npmax - npmin) * 255).astype(np.uint8)
 
         # Drop values that are in the lowest percentiles
         truncated_vals = numpy_image[numpy_image >= int(255 * drop_least)]
@@ -226,19 +231,16 @@ def iterative_otsus(probab_mask, s_mask, maxiters=5, mode='ordinary',
 
 
 def calcthresh(fused_pred, s_masks, method='otsus'):
-    #     if method=='iterotsus':
-    #         thresh = iterative_otsus(fused_pred,s_masks,maxiters=5)[0]
-    #         return thresh
-    #     elif method=='1iterotsus':
-    #         thresh = iterative_otsus(fused_pred,s_masks,maxiters=1)[0]
-    #         return thresh
+    mean_thresh = fused_pred.mean(dim=(-2, -1))
+    if method == 'mean':
+        return mean_thresh
     if method == 'otsus':
         thresh = otsus(fused_pred)[0]
         return thresh
     elif method == 'pred_mean':
         otsu_thresh = otsus(fused_pred)[0]
-        thresh = torch.max(otsu_thresh, fused_pred.mean())
-    return thresh
+        return torch.maximum(otsu_thresh, mean_thresh)
+    raise ValueError("Unknown threshold method {!r}; choose from 'otsus', 'mean', 'pred_mean'".format(method))
 
 
 def thresh_fn(method):
@@ -301,8 +303,89 @@ def thresh_fn(method):
 #     return fg_pred_clustered
 
 
-def install_pydensecrf():
-    os.system('pip install git+https://github.com/lucasb-eyer/pydensecrf.git')
+def imagenet_denormalize(image_tensor):
+    mean = image_tensor.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1)
+    std = image_tensor.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1)
+    return image_tensor * std + mean
+
+
+def _box_filter(tensor, radius):
+    kernel_size = radius * 2 + 1
+    return F.avg_pool2d(
+        tensor, kernel_size=kernel_size, stride=1, padding=radius, count_include_pad=False
+    )
+
+
+def guided_filter(rgb_image, probability, radius=8, eps=1e-3):
+    if rgb_image.ndim != 4 or rgb_image.shape[1] != 3:
+        raise ValueError('Guidance image must have shape [B, 3, H, W]')
+    if probability.ndim == 3:
+        probability = probability.unsqueeze(1)
+    if probability.ndim != 4 or probability.shape[1] != 1:
+        raise ValueError('Probability map must have shape [B, H, W] or [B, 1, H, W]')
+    if rgb_image.shape[0] != probability.shape[0]:
+        raise ValueError('Guidance image and probability map must have the same batch size')
+    if radius < 0 or eps <= 0:
+        raise ValueError('Guided filter radius must be nonnegative and eps must be positive')
+
+    if rgb_image.shape[-2:] != probability.shape[-2:]:
+        rgb_image = F.interpolate(
+            rgb_image, size=probability.shape[-2:], mode='bilinear', align_corners=False
+        )
+    guide = imagenet_denormalize(rgb_image).clamp(0, 1)
+    probability = probability.clamp(0, 1)
+
+    mean_guide = _box_filter(guide, radius)
+    mean_probability = _box_filter(probability, radius)
+    guide_products = guide.unsqueeze(2) * guide.unsqueeze(1)
+    covariance_guide = _box_filter(
+        guide_products.flatten(1, 2), radius
+    ).view(guide.shape[0], 3, 3, *guide.shape[-2:])
+    covariance_guide = covariance_guide - mean_guide.unsqueeze(2) * mean_guide.unsqueeze(1)
+    covariance_guide_probability = _box_filter(guide * probability) - mean_guide * mean_probability
+
+    covariance_guide = covariance_guide.permute(0, 3, 4, 1, 2)
+    covariance_guide_probability = covariance_guide_probability.permute(0, 2, 3, 1).unsqueeze(-1)
+    identity = torch.eye(3, device=guide.device, dtype=guide.dtype).view(1, 1, 1, 3, 3)
+    coefficients = torch.linalg.solve(
+        covariance_guide + eps * identity, covariance_guide_probability
+    ).squeeze(-1).permute(0, 3, 1, 2)
+    intercept = mean_probability - (coefficients * mean_guide).sum(dim=1, keepdim=True)
+
+    mean_coefficients = _box_filter(coefficients, radius)
+    mean_intercept = _box_filter(intercept, radius)
+    refined = (mean_coefficients * guide).sum(dim=1, keepdim=True) + mean_intercept
+    return refined.squeeze(1).clamp(0, 1)
+
+
+def _morphology(mask, operation, kernel_size=3):
+    if mask.ndim == 3:
+        mask = mask.unsqueeze(1)
+    if mask.ndim != 4 or mask.shape[1] != 1:
+        raise ValueError('Mask must have shape [B, H, W] or [B, 1, H, W]')
+    if kernel_size <= 0 or kernel_size % 2 == 0:
+        raise ValueError('Morphology kernel size must be a positive odd number')
+    padding = kernel_size // 2
+
+    def dilate(value):
+        return F.max_pool2d(value, kernel_size, stride=1, padding=padding)
+
+    def erode(value):
+        return -F.max_pool2d(-value, kernel_size, stride=1, padding=padding)
+
+    if operation == 'open':
+        result = dilate(erode(mask.float()))
+    elif operation == 'close':
+        result = erode(dilate(mask.float()))
+    elif operation == 'open_close':
+        result = erode(dilate(dilate(erode(mask.float()))))
+    else:
+        raise ValueError("Unknown morphology operation {!r}".format(operation))
+    return (result.squeeze(1) >= 0.5).to(mask.dtype)
+
+
+def morphological_filter(mask, operation, kernel_size=3):
+    return _morphology(mask, operation, kernel_size)
 
 
 class CRF:
@@ -332,23 +415,20 @@ class CRF:
         """
         try:
             import pydensecrf.densecrf as dcrf
-            from pydensecrf.utils import unary_from_softmax, create_pairwise_bilateral
-        except ImportError as e:
-            print("pydensecrf not found. Installing...")
-            install_pydensecrf()  # Ensure this function installs pydensecrf and handles any potential errors during installation.
-
-        # After installation, retry importing. This is placed inside the except block to avoid repeating the import statements.
-        try:
-            import pydensecrf.densecrf as dcrf
-            from pydensecrf.utils import unary_from_softmax, create_pairwise_bilateral
-        except ImportError as e:
-            print("Failed to import after installation. Please check the installation of pydensecrf.")
-            raise  # This will raise the last exception that was handled by the except block
+            from pydensecrf.utils import unary_from_softmax
+        except ImportError as exc:
+            raise ImportError(
+                'DenseCRF requires pydensecrf; install it separately to use CRF post-processing'
+            ) from exc
 
         # We find the segmentation threshold that splits fg-bg
         if soft_thresh is None:
             soft_thresh, _ = otsus(fg_probs)
-        image_tensor, fg_probs, soft_thresh = image_tensor.cpu(), fg_probs.cpu(), soft_thresh.cpu()
+        image_tensor = imagenet_denormalize(image_tensor.detach().cpu()).clamp(0, 1)
+        fg_probs = fg_probs.detach().cpu()
+        soft_thresh = torch.as_tensor(soft_thresh).detach().to(
+            device=fg_probs.device, dtype=fg_probs.dtype
+        ).reshape(-1, 1, 1)
         # Then we presume at this threshold the probability should be 0.5
         # probability 0 should stay 0, 1 should stay 1
         # sigmoid=lambda x: 1/(1 + np.exp(-x))
@@ -385,11 +465,11 @@ class CRF:
         return torch.from_numpy(np.stack(refined_masks, axis=0))
 
     def iterrefine(self, iters, q_img, fg_probs, thresh_fn, debug=False):
-        pred = fg_probs.unsqueeze(1).expand(1, 2, *fg_probs.shape[-2:])
+        pred = fg_probs.unsqueeze(1).expand(-1, 2, *fg_probs.shape[-2:])
         for it in range(iters):
             thresh = thresh_fn(pred[:, 1])[0]
 
-            if debug and i % 10 == 0:
+            if debug and it % 10 == 0:
                 print('thresh', thresh)
                 display(to_pil(pred[0, 1]))
 

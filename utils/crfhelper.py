@@ -30,7 +30,10 @@ def crf_is_good(sseval):
     pseudoquery = s_feat # treat support image as query with
     pseudosupport = s_feataug # and augmented as support
 
-    pred_maps = dautils.DAMatComparison().forward(pseudoquery,pseudosupport, s_maskaug)
+    fusion_method = getattr(sseval, 'fusion_method', 'mean')
+    pred_maps = dautils.DAMatComparison(fusion_method).forward(
+        pseudoquery, pseudosupport, s_maskaug, l0=0
+    )
 
     # in 5-shot, you will predict 5 pseudoqueries, and pred_map.shape[0]=1
     crf_yes_votes = 0

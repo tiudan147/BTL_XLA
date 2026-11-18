@@ -10,7 +10,21 @@ def parse_opts():
     parser.add_argument('--datapath', type=str)
     parser.add_argument('--nshot', type=int, default=1)
     parser.add_argument('--adapt-to', type=str, default='first-episode', choices=['first-episode', 'every-episode'])
-    parser.add_argument('--postprocessing', type=str, default='off', choices=['off', 'dynamic', 'always'])
+    parser.add_argument(
+        '--fusion-method', type=str, default='mean',
+        choices=['mean', 'low', 'mid', 'high', 'stage_uniform', 'low_biased', 'high_biased'],
+        help='How to combine the 13 ResNet50 layer predictions',
+    )
+    parser.add_argument(
+        '--threshold-method', type=str, default='pred_mean',
+        choices=['otsus', 'mean', 'pred_mean'],
+        help='Threshold for converting foreground probabilities to a binary mask',
+    )
+    parser.add_argument(
+        '--postprocessing', type=str, default='off',
+        choices=['off', 'dynamic', 'always', 'guided', 'morph-open', 'morph-close', 'morph-open-close'],
+        help='Optional refinement after thresholding; dynamic/always use DenseCRF',
+    )
     parser.add_argument('--logpath', type=str, default='./logs')
     parser.add_argument('--verbosity', type=int, default=0)
 

@@ -66,11 +66,12 @@ def makeFeatureMaker(dataset, config, device='cpu', randseed=2, feat_extr_method
 # Motivation of this class: Handle every task individually -> create an object for each task, example: see main.py
 class SingleSampleEval:
     def __init__(self, batch, feat_maker):
-        self.damat_comp = dautils.DAMatComparison()
+        self.fusion_method = getattr(args, 'fusion_method', 'mean')
+        self.damat_comp = dautils.DAMatComparison(self.fusion_method)
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.batch = batch
         self.feat_maker = feat_maker
-        self.thresh_method = 'pred_mean'
+        self.thresh_method = getattr(args, 'threshold_method', 'pred_mean')
         self.post_proc_method = 'off'
         self.verbosity = args.verbosity
 
@@ -94,20 +95,30 @@ class SingleSampleEval:
         if method is None:
             method = self.thresh_method
         self.thresh = segutils.calcthresh(self.logit_mask, self.s_mask, method)
-        self.pred_mask = (self.logit_mask > self.thresh).float()
+        self.pred_mask = (self.logit_mask > self.thresh.reshape(-1, 1, 1)).float()
         return self.thresh, self.pred_mask
 
     def postprocess(self):
         if self.post_proc_method == 'off':
-            apply = False
+            return self.pred_mask
         elif self.post_proc_method == 'always':
-            apply = True
+            return crfutils.apply_crf(
+                self.q_img, self.logit_mask, segutils.thresh_fn(self.thresh_method)
+            ).to(self.device)
         elif self.post_proc_method == 'dynamic':
-            apply = crfutils.crf_is_good(self)
+            if crfutils.crf_is_good(self):
+                return crfutils.apply_crf(
+                    self.q_img, self.logit_mask, segutils.thresh_fn(self.thresh_method)
+                ).to(self.device)
+            return self.pred_mask
+        elif self.post_proc_method == 'guided':
+            refined = segutils.guided_filter(self.q_img, self.logit_mask)
+            return (refined > self.thresh[:, None, None]).float()
+        elif self.post_proc_method in {'morph-open', 'morph-close', 'morph-open-close'}:
+            operation = self.post_proc_method[len('morph-'):].replace('-', '_')
+            return segutils.morphological_filter(self.pred_mask, operation)
         else:
-            apply = False
-            print(f'Unknown postproc method: {self.post_proc_method=}')
-        return crfutils.apply_crf(self.q_img, self.logit_mask, segutils.thresh_fn(self.thresh_method)).to(self.device) if apply else self.pred_mask
+            raise ValueError(f'Unknown post-processing method: {self.post_proc_method!r}')
 
     # this method calls above components sequentially
     def forward(self):

@@ -57,10 +57,64 @@ def upsample(volume, h, w):
 
 class DAMatComparison:
 
+    FUSION_METHODS = {
+        'mean', 'low', 'mid', 'high', 'stage_uniform', 'low_biased', 'high_biased'
+    }
+    STAGE_SLICES = (slice(0, 4), slice(4, 10), slice(10, 13))
+    STAGE_WEIGHTS = {
+        'stage_uniform': (1 / 3, 1 / 3, 1 / 3),
+        'low_biased': (0.5, 0.3, 0.2),
+        'high_biased': (0.2, 0.3, 0.5),
+    }
+
+    def __init__(self, fusion_method='mean'):
+        self.set_fusion_method(fusion_method)
+
+    def set_fusion_method(self, fusion_method):
+        if fusion_method not in self.FUSION_METHODS:
+            raise ValueError(
+                f"Unknown fusion method {fusion_method!r}; "
+                f"choose from {sorted(self.FUSION_METHODS)}"
+            )
+        self.fusion_method = fusion_method
+
+    @classmethod
+    def fuse_predictions(cls, q_pred_coarses_t, fusion_method='mean'):
+        if fusion_method not in cls.FUSION_METHODS:
+            raise ValueError(
+                f"Unknown fusion method {fusion_method!r}; "
+                f"choose from {sorted(cls.FUSION_METHODS)}"
+            )
+        if q_pred_coarses_t.ndim != 4:
+            raise ValueError('Layer predictions must have shape [B, layers, H, W]')
+        if fusion_method == 'mean':
+            return q_pred_coarses_t.mean(dim=1)
+        if q_pred_coarses_t.shape[1] != 13:
+            raise ValueError(
+                f"Fusion method {fusion_method!r} requires 13 layer predictions; "
+                f"got {q_pred_coarses_t.shape[1]}"
+            )
+
+        stage_predictions = torch.stack(
+            [q_pred_coarses_t[:, stage].mean(dim=1) for stage in cls.STAGE_SLICES],
+            dim=1,
+        )
+        if fusion_method == 'low':
+            return stage_predictions[:, 0]
+        if fusion_method == 'mid':
+            return stage_predictions[:, 1]
+        if fusion_method == 'high':
+            return stage_predictions[:, 2]
+
+        weights = q_pred_coarses_t.new_tensor(cls.STAGE_WEIGHTS[fusion_method])
+        return (stage_predictions * weights.view(1, 3, 1, 1)).sum(dim=1)
+
     def algo_mean(self, q_pred_coarses_t, s_mask=None):
         return q_pred_coarses_t.mean(1)
 
     def calc_q_pred_coarses(self, q_feat_t, s_feat_t, s_mask, l0=3):
+        if len(q_feat_t) != len(s_feat_t):
+            raise ValueError('Query and support must provide the same number of feature maps')
         q_pred_coarses = []
         h0, w0 = q_feat_t[l0].shape[-2:]
         for (qft, sft) in zip(q_feat_t[l0:], s_feat_t[l0:]):
@@ -78,15 +132,15 @@ class DAMatComparison:
             q_pred_coarses.append(q_pred_coarse)
         return torch.stack(q_pred_coarses, dim=1)
 
-    def forward(self, q_feat_t, s_feat_t, s_mask, upsample=True, debug=False):
-        q_pred_coarses_t = self.calc_q_pred_coarses(q_feat_t, s_feat_t, s_mask)
+    def forward(self, q_feat_t, s_feat_t, s_mask, upsample=True, debug=False,
+                fusion_method=None, l0=3):
+        q_pred_coarses_t = self.calc_q_pred_coarses(q_feat_t, s_feat_t, s_mask, l0=l0)
 
         if debug: display(segutils.pilImageRow(*q_pred_coarses_t.unbind(1), q_pred_coarses_t.mean(1)))
 
-        # select the algorithm
-        postprocessing_algorithm = self.algo_mean
-        # do the postprocessing
-        logit_mask = postprocessing_algorithm(q_pred_coarses_t, s_mask)
+        if fusion_method is None:
+            fusion_method = self.fusion_method
+        logit_mask = self.fuse_predictions(q_pred_coarses_t, fusion_method)
         if upsample:  # if query and support have different shape, then you must do upsampling yourself afterwards
             logit_mask = segutils.downsample_mask(logit_mask, *s_mask.shape[-2:])
 
