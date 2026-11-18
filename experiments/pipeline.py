@@ -27,6 +27,27 @@ if str(REPO_ROOT) not in sys.path:
 from experiments import cache_features, common, report, run_experiments  # noqa: E402
 
 BENCHMARKS = ["deepglobe", "isic", "lung", "fss", "suim"]
+SUBDIRS = {
+    "deepglobe": "deepglobe",
+    "isic": "isic2018-classwise",
+    "lung": "lungsegmentation",
+    "fss": "fss1000",
+    "suim": "suim",
+}
+
+
+def resolve_datapath(benchmark: str, datapath: str) -> str:
+    """Accept either the Kaggle root (containing all five datasets) or a
+    benchmark-specific directory."""
+    p = Path(datapath).expanduser()
+    sub = SUBDIRS[benchmark]
+    if benchmark == "fss":
+        if p.name == "FSS-1000":
+            return str(p.parent)
+        return str(p)
+    if (p / sub).exists():
+        return str(p / sub)
+    return str(p)
 
 
 def _cache_complete(cache_dir: Path, benchmark: str, shot: int, seed: int) -> bool:
@@ -93,8 +114,8 @@ def pipeline(args: argparse.Namespace) -> Dict[str, Any]:
         if g not in {"A", "B", "C", "X"}:
             raise ValueError(f"Unknown group {g!r}; choose from A,B,C,X")
 
-    cache_dir = Path(args.cache_dir)
-    results_dir = Path(args.results_dir)
+    cache_dir = Path(args.cache_dir).resolve()
+    results_dir = Path(args.results_dir).resolve()
     results_dir.mkdir(parents=True, exist_ok=True)
     commits: Dict[str, str] = {}
     commits_path = results_dir / "commits.json"
@@ -102,6 +123,7 @@ def pipeline(args: argparse.Namespace) -> Dict[str, Any]:
         with open(commits_path) as f:
             commits = json.load(f)
 
+    resolved = {b: resolve_datapath(b, args.datapath) for b in benchmarks}
     run_info = {
         "benchmarks": benchmarks,
         "groups": groups,
@@ -110,6 +132,7 @@ def pipeline(args: argparse.Namespace) -> Dict[str, Any]:
         "max_episodes": args.max_episodes,
         "crf_max_episodes": args.crf_max_episodes,
         "datapath": args.datapath,
+        "resolved_datapaths": resolved,
         "cache_dir": str(cache_dir),
         "results_dir": str(results_dir),
         "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -126,7 +149,7 @@ def pipeline(args: argparse.Namespace) -> Dict[str, Any]:
             continue
         cache_features.cache_benchmark(
             benchmark=b,
-            datapath=args.datapath,
+            datapath=resolve_datapath(b, args.datapath),
             shot=args.shot,
             seed=args.seed,
             cache_dir=cache_dir,

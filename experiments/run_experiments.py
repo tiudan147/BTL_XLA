@@ -166,6 +166,11 @@ def run_group(
         group_label = group.upper()
     if not configs:
         raise ValueError(f"No configurations for group {group!r}")
+    if not all_indices:
+        raise RuntimeError(
+            f"No cached episodes for {benchmark} shot={shot} seed={seed} "
+            f"in {cache_dir}"
+        )
 
     if any(common.is_crf_config(c) for c in configs):
         try:
@@ -269,6 +274,8 @@ def run_group(
     results_dir.mkdir(parents=True, exist_ok=True)
     stem = f"{benchmark}_shot{shot}_seed{seed}_group{group_label}"
     csv_path = results_dir / f"{stem}.csv"
+    if not rows:
+        raise RuntimeError(f"No results produced for {benchmark} group {group_label}")
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
