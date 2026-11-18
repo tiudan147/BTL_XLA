@@ -42,6 +42,10 @@ def resolve_datapath(benchmark: str, datapath: str) -> str:
     p = Path(datapath).expanduser()
     sub = SUBDIRS[benchmark]
     if benchmark == "fss":
+        if (p / "fss1000").exists():
+            return str(p / "fss1000")
+        if p.name == "fss1000":
+            return str(p)
         if p.name == "FSS-1000":
             return str(p.parent)
         return str(p)

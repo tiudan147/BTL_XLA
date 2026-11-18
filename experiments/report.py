@@ -149,15 +149,19 @@ def table_group(
         if base_rows:
             base_miou = sum(float(r["mIoU"]) for r in base_rows) / len(base_rows)
             base_fb = sum(float(r["FB-IoU"]) for r in base_rows) / len(base_rows)
-            base_for_note = base_rows[0]
+            base_fg = sum(float(r["FG_pred"]) for r in base_rows) / len(base_rows)
         else:
             # The group's own baseline is not part of that group's CSV (e.g.
-            # group B compares against B0, which lives in group B, while the
-            # reference metrics come from group A).  Use the supplied row.
+            # group X does not contain A0).  Use the supplied averaged row.
             base_miou = float(baseline.get("mIoU", 0.0))
             base_fb = float(baseline.get("FB-IoU", 0.0))
-            base_for_note = baseline
-        note = auto_note(rows[0], base_for_note) if include_note else ""
+            base_fg = float(baseline.get("FG_pred", 0.0))
+        note = ""
+        if include_note:
+            note = auto_note(
+                {"mIoU": miou or 0.0, "FB-IoU": fb or 0.0, "FG_pred": fg or 0.0},
+                {"mIoU": base_miou, "FB-IoU": base_fb, "FG_pred": base_fg},
+            )
         desc = rows[0].get("note", "")
         lines.append(
             f"| `{name}` | {desc} | {rows[0].get('shot', '1')} | {rows[0].get('seed', '0')} | "
@@ -276,6 +280,11 @@ def generate(
     n_episodes = meta.get("n_episodes") if meta else "?"
     code_commit = meta.get("code_commit") if meta else "unknown"
     device = meta.get("device") if meta else "?"
+    try:
+        import torch as _torch
+        hardware = _torch.cuda.get_device_name(0) if _torch.cuda.is_available() else "CPU"
+    except Exception:
+        hardware = device
 
     lines: List[str] = []
     lines.append("## 6. Nhật ký thí nghiệm\n")
@@ -287,7 +296,7 @@ def generate(
     lines.append(
         f"- **Shot:** {shot}; **seed:** {seed}; **số episode/tập:** {n_episodes} "
         "(lấy mẫu phân tầng đều trên toàn bộ test split; đặt `--max-episodes 0` để chạy toàn bộ).\n"
-        f"- **Thiết bị sinh cache adapter:** `{device}`; code commit `{code_commit}`.\n"
+        f"- **Thiết bị sinh cache adapter:** `{device}` ({hardware}); code commit `{code_commit}`.\n"
         "- **Adapter:** đóng băng ResNet50 + adapter 2 lớp Conv 1×1, SGD 25 epoch, lr 0.01, "
         "2 augmentation shear tối đa 20° (đúng cấu hình gốc). Adapter được fit một lần cho "
         "mỗi lớp (first-episode) và **dùng lại** cho mọi biến thể đầu ra.\n"
@@ -358,6 +367,12 @@ def generate(
             lines.append(
                 "\n*Nhóm C dùng tập con CRF; `C1_off` trong bảng này cũng chạy trên đúng "
                 "tập con đó nên so sánh là ghép cặp.*\n"
+            )
+        if group == "X":
+            lines.append(
+                "\n*Nhóm X chạy trên cùng tập con CRF như nhóm C (200 episode/tập). "
+                "Cột Δ so với baseline A0 (600 episode) chỉ mang tính tham khảo; "
+                "so sánh công bằng là giữa các dòng X với nhau và với C0/C1 trong nhóm C.*\n"
             )
 
     # A5 grid compact

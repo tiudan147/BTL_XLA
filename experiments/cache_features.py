@@ -129,7 +129,9 @@ def cache_benchmark(
 
     existing_meta = _load_meta(cache_dir)
     if existing_meta and existing_meta.get("episode_indices") != indices:
-        if resume:
+        # An empty cache (n_episodes == 0) can be safely replaced; a non-empty
+        # cache with a different selection is ambiguous, so refuse.
+        if resume and existing_meta.get("n_episodes", 0) > 0:
             raise RuntimeError(
                 f"Cache {cache_dir} exists with a different episode selection. "
                 "Delete it or use --no-resume."
@@ -161,6 +163,11 @@ def cache_benchmark(
             sseval = runner.SingleSampleEval(batch, feat_maker)
             sseval.taskAdapt()
             del sseval, batch
+            if (j + 1) % 25 == 0 or j + 1 == len(first_idx):
+                print(
+                    f"[cache] fitted adapters {j + 1}/{len(first_idx)}",
+                    flush=True,
+                )
             if device == "cuda" and (j + 1) % 50 == 0:
                 torch.cuda.empty_cache()
 
