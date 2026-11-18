@@ -13,7 +13,7 @@ class ContrastiveConfig:
         if config is None:
             self._data = {
                 'aug': {
-                    'n_transformed_imgs': 2,
+                    'n_transformed_imgs': 3,
                     'blurkernelsize': [3],  # chooses one of this kernel sizes
                     'maxjitter': 0.2,
                     'maxangle': 15,  # rotation

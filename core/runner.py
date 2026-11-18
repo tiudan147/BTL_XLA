@@ -43,7 +43,7 @@ def makeConfig():
     config.model.debug = args.verbosity > 0
     config.featext.fit_every_episode = False
     config.aug.blurkernelsize = [3]
-    config.aug.n_transformed_imgs = 2
+    config.aug.n_transformed_imgs = 3
     config.aug.maxjitter = 0.2
     config.aug.maxangle = 15
     config.aug.maxscale = 1
