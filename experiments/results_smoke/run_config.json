@@ -1,0 +1,29 @@
+{
+  "benchmarks": [
+    "lung"
+  ],
+  "groups": [
+    "A",
+    "B",
+    "C",
+    "X"
+  ],
+  "shot": 1,
+  "seed": 0,
+  "max_episodes": 5,
+  "crf_max_episodes": 3,
+  "datapath": "/home/nhanlx05/.cache/kagglehub/datasets/dantiu/cdfss-benchmark-dataset/versions/1",
+  "resolved_datapaths": {
+    "lung": "/home/nhanlx05/.cache/kagglehub/datasets/dantiu/cdfss-benchmark-dataset/versions/1/lungsegmentation"
+  },
+  "cache_dir": "/tmp/cache_smoke",
+  "results_dir": "/home/nhanlx05/projects/BTL_XLA/experiments/results_smoke",
+  "started_at": "2026-11-18 09:07:14",
+  "finished_at": "2026-11-18 09:07:33",
+  "commits": {
+    "A": "19b64913bc47ddf44468f85030d1bfc10072e201",
+    "B": "e05c495e8b67ebf0033b6585fb34a6e08d8c9df6",
+    "C": "e49101bc4d4075bd4f7e62c9c822489f38234249",
+    "X": "ce724af9bf34c19a2e304f824e2171f767dc6f5f"
+  }
+}
