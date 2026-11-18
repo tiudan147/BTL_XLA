@@ -86,6 +86,24 @@ def _write_meta(cache_dir: Path, meta: Dict[str, Any]) -> None:
     os.replace(tmp, cache_dir / "meta.json")
 
 
+def _move_augimgs(feat_maker: Any, class_id: int, device: str) -> None:
+    """Move one class's cached augmentation tensors between CPU and GPU.
+
+    ``CTrBuilder.augimgs`` keeps the augmented query/support images and masks
+    for every class.  On FSS-1000 (240 test classes) that is several GB on the
+    GPU; moving them to CPU after fitting and back only for the class being
+    processed keeps the 4 GB GPUs usable.
+    """
+    c_tr = feat_maker.c_trs.get(class_id)
+    if c_tr is None:
+        return
+    target = torch.device(device)
+    for name in ("q", "s", "s_mask"):
+        value = getattr(c_tr.augimgs, name, None)
+        if value is not None and value.device != target:
+            setattr(c_tr.augimgs, name, value.to(target))
+
+
 def cache_benchmark(
     benchmark: str,
     datapath: str,
@@ -162,7 +180,10 @@ def cache_benchmark(
             batch = default_collate([dataset[idx]])
             sseval = runner.SingleSampleEval(batch, feat_maker)
             sseval.taskAdapt()
+            _move_augimgs(feat_maker, cid, "cpu")
             del sseval, batch
+            if device == "cuda":
+                torch.cuda.empty_cache()
             if (j + 1) % 25 == 0 or j + 1 == len(first_idx):
                 print(
                     f"[cache] fitted adapters {j + 1}/{len(first_idx)}",
@@ -192,6 +213,7 @@ def cache_benchmark(
         # support as support).  The augmentations are the ones created when the
         # adapter was fitted, exactly as in utils/crfhelper.crf_is_good.
         s_feat = [f[0] for f in sseval.task_adapted[1] if f is not None]
+        _move_augimgs(feat_maker, int(sseval.class_id), device)
         s_feataug, s_maskaug = crfhelper.get_augmentations_and_features(sseval)
         # s_feat/s_feataug already had the first l0 layers removed by
         # getTaskAdaptedFeats, hence l0=0 here (13 layers -> 13 maps).
@@ -220,6 +242,7 @@ def cache_benchmark(
         }
         _save_episode(path, arrays)
         written += 1
+        _move_augimgs(feat_maker, int(sseval.class_id), "cpu")
         del sseval, batch, layers, pseudo_layers
         if device == "cuda" and (n + 1) % 100 == 0:
             torch.cuda.empty_cache()
