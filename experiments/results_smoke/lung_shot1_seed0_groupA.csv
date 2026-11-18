@@ -1,0 +1,43 @@
+group,shot,seed,name,fusion,fusion_params,threshold,threshold_params,postproc,postproc_params,mIoU,FB-IoU,FG_pred,FG_gt,n_episodes,seconds,per_class_iou,note
+A,1,0,A0_mean,mean,{},pred_mean,{},none,{},76.0885,83.8424,23.4716,25.3575,5,0.058,"{""0"": 76.08851464350272}",baseline fusion (13-layer mean)
+A,1,0,A1_low,low,{},pred_mean,{},none,{},61.022,71.4395,33.0134,25.3575,5,0.01,"{""0"": 61.02199295177274}",only Low (layers 1-4)
+A,1,0,A2_mid,mid,{},pred_mean,{},none,{},71.6419,81.1203,20.6245,25.3575,5,0.011,"{""0"": 71.6418746150544}",only Mid (layers 5-10)
+A,1,0,A3_high,high,{},pred_mean,{},none,{},63.837,74.0697,30.3299,25.3575,5,0.009,"{""0"": 63.8369937774901}",only High (layers 11-13)
+A,1,0,A4_low_mid,low_mid,{},pred_mean,{},none,{},74.204,82.6729,22.3154,25.3575,5,0.007,"{""0"": 74.20396566923523}",Low + Mid
+A,1,0,A4_mid_high,mid_high,{},pred_mean,{},none,{},73.7696,82.3091,22.8581,25.3575,5,0.009,"{""0"": 73.76956864511769}",Mid + High
+A,1,0,A4_low_high,low_high,{},pred_mean,{},none,{},73.2415,81.3303,27.7622,25.3575,5,0.007,"{""0"": 73.2415266329118}",Low + High
+A,1,0,A6_adaptive_otsu,adaptive_otsu,"{""temperature"": 10.0}",pred_mean,{},none,{},75.2577,83.1247,24.7279,25.3575,5,0.011,"{""0"": 75.25773646801531}",per-episode stage weights from Otsu separability
+A,1,0,A6_adaptive_contrast,adaptive_contrast,"{""temperature"": 10.0}",pred_mean,{},none,{},70.5478,79.902,24.1223,25.3575,5,0.008,"{""0"": 70.547785849081}",per-episode stage weights from map contrast
+A,1,0,A6_adaptive_entropy,adaptive_entropy,"{""temperature"": 10.0}",pred_mean,{},none,{},62.4672,73.8295,26.0683,25.3575,5,0.01,"{""0"": 62.46722269611096}",per-episode stage weights from histogram entropy
+A,1,0,A7_norm_minmax,norm_minmax_mean,{},pred_mean,{},none,{},77.3601,84.7121,23.55,25.3575,5,0.007,"{""0"": 77.36013272771778}",per-layer min-max normalisation before mean
+A,1,0,A7_norm_zscore,norm_zscore_mean,{},pred_mean,{},none,{},77.35,84.7108,23.4949,25.3575,5,0.008,"{""0"": 77.34995416715827}",per-layer z-score normalisation before mean
+A,1,0,A8_max,max,{},pred_mean,{},none,{},62.7048,74.3672,23.9974,25.3575,5,0.008,"{""0"": 62.70480319113866}",layer-wise max
+A,1,0,A8_geomean,geomean,{},pred_mean,{},none,{},76.9924,84.4154,23.959,25.3575,5,0.008,"{""0"": 76.9924049724327}",layer-wise geometric mean
+A,1,0,A8_median,median,{},pred_mean,{},none,{},76.5909,84.2121,23.2586,25.3575,5,0.011,"{""0"": 76.5908564630885}",layer-wise median
+A,1,0,A5_w0.5_0.5_0.5,weighted_stage,"{""weights"": [0.5, 0.5, 0.5]}",pred_mean,{},none,{},76.149,83.7881,24.3509,25.3575,5,0.012,"{""0"": 76.14902815429048}",stage weights L/M/H=0.5/0.5/0.5
+A,1,0,A5_w0.5_0.5_1,weighted_stage,"{""weights"": [0.5, 0.5, 1.0]}",pred_mean,{},none,{},74.4129,82.4654,25.3057,25.3575,5,0.013,"{""0"": 74.41293037786757}",stage weights L/M/H=0.5/0.5/1
+A,1,0,A5_w0.5_0.5_2,weighted_stage,"{""weights"": [0.5, 0.5, 2.0]}",pred_mean,{},none,{},70.4801,79.4043,27.3569,25.3575,5,0.012,"{""0"": 70.48013291883784}",stage weights L/M/H=0.5/0.5/2
+A,1,0,A5_w0.5_1_0.5,weighted_stage,"{""weights"": [0.5, 1.0, 0.5]}",pred_mean,{},none,{},75.647,83.5578,23.2849,25.3575,5,0.012,"{""0"": 75.64704395475432}",stage weights L/M/H=0.5/1/0.5
+A,1,0,A5_w0.5_1_1,weighted_stage,"{""weights"": [0.5, 1.0, 1.0]}",pred_mean,{},none,{},75.0015,83.0194,24.0896,25.3575,5,0.008,"{""0"": 75.00154838481345}",stage weights L/M/H=0.5/1/1
+A,1,0,A5_w0.5_1_2,weighted_stage,"{""weights"": [0.5, 1.0, 2.0]}",pred_mean,{},none,{},72.6972,81.2198,25.605,25.3575,5,0.01,"{""0"": 72.69715941341421}",stage weights L/M/H=0.5/1/2
+A,1,0,A5_w0.5_2_0.5,weighted_stage,"{""weights"": [0.5, 2.0, 0.5]}",pred_mean,{},none,{},74.5827,82.9371,22.2844,25.3575,5,0.008,"{""0"": 74.58270731796695}",stage weights L/M/H=0.5/2/0.5
+A,1,0,A5_w0.5_2_1,weighted_stage,"{""weights"": [0.5, 2.0, 1.0]}",pred_mean,{},none,{},74.6298,82.8934,22.9458,25.3575,5,0.009,"{""0"": 74.62977273446221}",stage weights L/M/H=0.5/2/1
+A,1,0,A5_w0.5_2_2,weighted_stage,"{""weights"": [0.5, 2.0, 2.0]}",pred_mean,{},none,{},74.1583,82.4455,23.9785,25.3575,5,0.009,"{""0"": 74.15830487234474}",stage weights L/M/H=0.5/2/2
+A,1,0,A5_w1_0.5_0.5,weighted_stage,"{""weights"": [1.0, 0.5, 0.5]}",pred_mean,{},none,{},75.9026,83.5543,24.9115,25.3575,5,0.008,"{""0"": 75.90258155383121}",stage weights L/M/H=1/0.5/0.5
+A,1,0,A5_w1_0.5_1,weighted_stage,"{""weights"": [1.0, 0.5, 1.0]}",pred_mean,{},none,{},75.7328,83.3756,25.444,25.3575,5,0.009,"{""0"": 75.73281099335401}",stage weights L/M/H=1/0.5/1
+A,1,0,A5_w1_0.5_2,weighted_stage,"{""weights"": [1.0, 0.5, 2.0]}",pred_mean,{},none,{},72.8624,81.1806,26.8219,25.3575,5,0.008,"{""0"": 72.8623842573421}",stage weights L/M/H=1/0.5/2
+A,1,0,A5_w1_1_0.5,weighted_stage,"{""weights"": [1.0, 1.0, 0.5]}",pred_mean,{},none,{},76.347,84.0009,23.6584,25.3575,5,0.008,"{""0"": 76.34702128520739}",stage weights L/M/H=1/1/0.5
+A,1,0,A5_w1_1_1,weighted_stage,"{""weights"": [1.0, 1.0, 1.0]}",pred_mean,{},none,{},76.149,83.7881,24.3509,25.3575,5,0.009,"{""0"": 76.14902815429048}",stage weights L/M/H=1/1/1
+A,1,0,A5_w1_1_2,weighted_stage,"{""weights"": [1.0, 1.0, 2.0]}",pred_mean,{},none,{},74.4129,82.4654,25.3057,25.3575,5,0.011,"{""0"": 74.41293037786757}",stage weights L/M/H=1/1/2
+A,1,0,A5_w1_2_0.5,weighted_stage,"{""weights"": [1.0, 2.0, 0.5]}",pred_mean,{},none,{},75.4449,83.4927,22.6164,25.3575,5,0.012,"{""0"": 75.44490818411633}",stage weights L/M/H=1/2/0.5
+A,1,0,A5_w1_2_1,weighted_stage,"{""weights"": [1.0, 2.0, 1.0]}",pred_mean,{},none,{},75.647,83.5578,23.2849,25.3575,5,0.008,"{""0"": 75.64704395475432}",stage weights L/M/H=1/2/1
+A,1,0,A5_w1_2_2,weighted_stage,"{""weights"": [1.0, 2.0, 2.0]}",pred_mean,{},none,{},75.0015,83.0194,24.0896,25.3575,5,0.009,"{""0"": 75.00154838481345}",stage weights L/M/H=1/2/2
+A,1,0,A5_w2_0.5_0.5,weighted_stage,"{""weights"": [2.0, 0.5, 0.5]}",pred_mean,{},none,{},74.5244,82.4495,26.0951,25.3575,5,0.008,"{""0"": 74.52438595226688}",stage weights L/M/H=2/0.5/0.5
+A,1,0,A5_w2_0.5_1,weighted_stage,"{""weights"": [2.0, 0.5, 1.0]}",pred_mean,{},none,{},75.1878,82.9281,26.0045,25.3575,5,0.009,"{""0"": 75.18780964075277}",stage weights L/M/H=2/0.5/1
+A,1,0,A5_w2_0.5_2,weighted_stage,"{""weights"": [2.0, 0.5, 2.0]}",pred_mean,{},none,{},74.9417,82.7114,26.371,25.3575,5,0.012,"{""0"": 74.94166187561298}",stage weights L/M/H=2/0.5/2
+A,1,0,A5_w2_1_0.5,weighted_stage,"{""weights"": [2.0, 1.0, 0.5]}",pred_mean,{},none,{},75.705,83.4388,24.7116,25.3575,5,0.013,"{""0"": 75.70503006987792}",stage weights L/M/H=2/1/0.5
+A,1,0,A5_w2_1_1,weighted_stage,"{""weights"": [2.0, 1.0, 1.0]}",pred_mean,{},none,{},75.9026,83.5543,24.9115,25.3575,5,0.011,"{""0"": 75.90258155383121}",stage weights L/M/H=2/1/1
+A,1,0,A5_w2_1_2,weighted_stage,"{""weights"": [2.0, 1.0, 2.0]}",pred_mean,{},none,{},75.7328,83.3756,25.444,25.3575,5,0.009,"{""0"": 75.73281099335401}",stage weights L/M/H=2/1/2
+A,1,0,A5_w2_2_0.5,weighted_stage,"{""weights"": [2.0, 2.0, 0.5]}",pred_mean,{},none,{},75.8002,83.658,23.3368,25.3575,5,0.007,"{""0"": 75.80024279183533}",stage weights L/M/H=2/2/0.5
+A,1,0,A5_w2_2_1,weighted_stage,"{""weights"": [2.0, 2.0, 1.0]}",pred_mean,{},none,{},76.347,84.0009,23.6584,25.3575,5,0.008,"{""0"": 76.34702128520739}",stage weights L/M/H=2/2/1
+A,1,0,A5_w2_2_2,weighted_stage,"{""weights"": [2.0, 2.0, 2.0]}",pred_mean,{},none,{},76.149,83.7881,24.3509,25.3575,5,0.008,"{""0"": 76.14902815429048}",stage weights L/M/H=2/2/2
