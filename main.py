@@ -1,4 +1,5 @@
 from core import runner
+from core.denseaffinity import DAMatComparison
 import torch
 import argparse
 
@@ -12,8 +13,28 @@ def parse_opts():
     parser.add_argument('--adapt-to', type=str, default='first-episode', choices=['first-episode', 'every-episode'])
     parser.add_argument(
         '--fusion-method', type=str, default='mean',
-        choices=['mean', 'geomean', 'low', 'mid', 'high', 'stage_uniform', 'low_biased', 'high_biased'],
-        help='How to combine the 13 ResNet50 layer predictions',
+        choices=sorted(DAMatComparison.FUSION_METHODS),
+        help='How to combine the 13 ResNet50 layer predictions. '
+             'high_suppressed downweights the coarse high stage and is tuned for ISIC; '
+             'pseudo_gate picks a method per episode on the Algorithm-1 pseudo episode.',
+    )
+    parser.add_argument(
+        '--stage-weights', type=float, nargs=3, default=None, metavar=('WL', 'WM', 'WH'),
+        help='Stage weights for weighted_stage / weighted_stage_geomean. '
+             'The ISIC group-A winner is 1 1 0.25 (same ratio as A5_w2_2_0.5).',
+    )
+    parser.add_argument(
+        '--fusion-trim', type=int, default=3,
+        help='Layers dropped from each side of the sorted layer predictions for trimmed_mean',
+    )
+    parser.add_argument(
+        '--fusion-temperature', type=float, default=10.0,
+        help='Softmax sharpening for agreement weighting',
+    )
+    parser.add_argument(
+        '--fusion-candidates', type=str, default=None,
+        help='Comma-separated candidates for pseudo_gate '
+             '(default: mean,high_suppressed,geomean,trimmed_mean,agreement)',
     )
     parser.add_argument(
         '--threshold-method', type=str, default='pred_mean',

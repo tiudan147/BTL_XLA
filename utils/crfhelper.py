@@ -30,8 +30,11 @@ def crf_is_good(sseval):
     pseudoquery = s_feat # treat support image as query with
     pseudosupport = s_feataug # and augmented as support
 
-    fusion_method = getattr(sseval, 'fusion_method', 'mean')
-    pred_maps = dautils.DAMatComparison(fusion_method).forward(
+    fusion_method = getattr(sseval, 'selected_fusion_method', None) or getattr(sseval, 'fusion_method', 'mean')
+    if fusion_method == 'pseudo_gate':  # unresolved selection method
+        fusion_method = 'mean'
+    fusion_params = getattr(sseval, 'fusion_params', None)
+    pred_maps = dautils.DAMatComparison(fusion_method, fusion_params).forward(
         pseudoquery, pseudosupport, s_maskaug, l0=0
     )
 

@@ -65,15 +65,19 @@ def makeFeatureMaker(dataset, config, device='cpu', randseed=2, feat_extr_method
 
 # Motivation of this class: Handle every task individually -> create an object for each task, example: see main.py
 class SingleSampleEval:
+    DEFAULT_FUSION_CANDIDATES = ('mean', 'high_suppressed', 'geomean', 'trimmed_mean', 'agreement')
+
     def __init__(self, batch, feat_maker):
         self.fusion_method = getattr(args, 'fusion_method', 'mean')
-        self.damat_comp = dautils.DAMatComparison(self.fusion_method)
+        self.fusion_params = self.make_fusion_params()
+        self.damat_comp = dautils.DAMatComparison(self.fusion_method, self.fusion_params)
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.batch = batch
         self.feat_maker = feat_maker
         self.thresh_method = getattr(args, 'threshold_method', 'pred_mean')
         self.post_proc_method = 'off'
         self.verbosity = args.verbosity
+        self.selected_fusion_method = None
 
     def taskAdapt(self, detach=True):
         b = self.batch
@@ -82,11 +86,93 @@ class SingleSampleEval:
             'class_id'].item()
         self.task_adapted = self.feat_maker.taskAdapt(self.q_img, self.s_img, self.s_mask, self.class_id)
 
+    @staticmethod
+    def make_fusion_params():
+        params = {
+            'trim': getattr(args, 'fusion_trim', 3),
+            'temperature': getattr(args, 'fusion_temperature', 10.0),
+        }
+        stage_weights = getattr(args, 'stage_weights', None)
+        if stage_weights is not None:
+            params['stage_weights'] = tuple(float(w) for w in stage_weights)
+        return params
+
+    def fusion_candidates(self):
+        raw = getattr(args, 'fusion_candidates', None)
+        if raw is None:
+            return list(self.DEFAULT_FUSION_CANDIDATES)
+        candidates = []
+        for name in raw.split(','):
+            name = name.strip()
+            if not name or name in candidates:
+                continue
+            if name not in dautils.DAMatComparison.PURE_FUSION_METHODS:
+                raise ValueError(
+                    f'Unknown pseudo-gate fusion candidate {name!r}; '
+                    f'choose from {sorted(dautils.DAMatComparison.PURE_FUSION_METHODS)}'
+                )
+            candidates.append(name)
+        if not candidates:
+            raise ValueError('--fusion-candidates must contain at least one method name')
+        return candidates
+
+    def pseudo_layer_predictions(self):
+        """Per-layer predictions on the Algorithm-1 pseudo episode.
+
+        The support image is the pseudo query and its augmentation (kept by
+        the fitted contrastive adapter) is the pseudo support. The support
+        mask is known, so candidate fusion methods can be compared without
+        touching any query label.
+        """
+        s_feat = [f[0] for f in self.task_adapted[1] if f is not None]
+        s_mask = self.s_mask[0]
+        s_feataug, s_maskaug = crfutils.get_augmentations_and_features(self)
+        # getTaskAdaptedFeats already removed the first l0 layers.
+        return self.damat_comp.calc_q_pred_coarses(s_feat, s_feataug, s_maskaug, l0=0), s_mask
+
+    def select_fusion_method(self):
+        """Pick the fusion method with the best pseudo-episode IoU."""
+        candidates = self.fusion_candidates()
+        pseudo_layers, pseudo_targets = self.pseudo_layer_predictions()
+        n_pseudo = pseudo_layers.shape[0]
+        targets = pseudo_targets.float()
+
+        scores = {}
+        for candidate in candidates:
+            candidate_scores = []
+            for i in range(n_pseudo):
+                fused = self.damat_comp.fuse_predictions(
+                    pseudo_layers[i:i + 1], candidate, self.fusion_params
+                )
+                # Match the final path: upsample the fused map to mask
+                # resolution, then threshold and score.
+                fused = segutils.downsample_mask(fused, *targets.shape[-2:])
+                thresh = self.thresh_method_fn(fused, targets[i:i + 1])
+                pred_mask = (fused > thresh.reshape(-1, 1, 1)).float()
+                candidate_scores.append(segutils.iou(pred_mask, targets[i:i + 1]))
+            scores[candidate] = sum(candidate_scores) / len(candidate_scores)
+
+        best = max(candidates, key=lambda name: scores[name])
+        if self.verbosity > 0:
+            printable = ', '.join(f'{name}={value:.4f}' for name, value in scores.items())
+            print(f'[pseudo-gate] selected {best!r} from pseudo-episode IoU: {printable}')
+        return best
+
+    def thresh_method_fn(self, fused_pred, s_masks):
+        return segutils.calcthresh(fused_pred, s_masks, self.thresh_method)
+
     def compare_feats(self):
         if self.task_adapted is None:
             print("error, do task adaption first")
             return None
-        self.logit_mask = self.damat_comp.forward(self.task_adapted[0], self.task_adapted[1], self.s_mask)
+        fusion_method = self.fusion_method
+        if fusion_method == 'pseudo_gate':
+            fusion_method = self.select_fusion_method()
+            self.selected_fusion_method = fusion_method
+        self.logit_mask = self.damat_comp.forward(
+            self.task_adapted[0], self.task_adapted[1], self.s_mask,
+            fusion_method=fusion_method,
+        )
         return self.logit_mask
 
     def threshold(self, method=None):
